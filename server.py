@@ -1,4 +1,7 @@
 import re
+import json
+import base64
+import graphviz
 import numpy as np
 import kuzu
 from collections import deque
@@ -129,6 +132,89 @@ def _recalculate_timeline(project_id: str):
             SET t.est_date = $est, t.eft_date = $eft
         """, {"name": name, "est": dates["est"], "eft": dates["eft"]})
 
+@mcp.resource("system://schema")
+def get_schema() -> str:
+    """Returns the strict database schema."""
+    schema = {
+        "nodes": {
+            "Project": ["id", "start_date", "name"],
+            "Task": ["name", "description", "duration", "cost", "est_date", "eft_date"]
+        },
+        "relationships": {
+            "CONTAINS": {"from": "Project", "to": "Task"},
+            "DEPENDS_ON": {"from": "Task", "to": "Task", "properties": ["lag"]}
+        }
+    }
+    return json.dumps(schema, indent=2)
+
+@mcp.resource("project://{project_id}/tasks")
+def get_project_tasks(project_id: str) -> str:
+    """Returns a markdown table of all tasks in a project."""
+    query = """
+    MATCH (p:Project {id: $project_id})-[:CONTAINS]->(t:Task)
+    RETURN t.name, t.duration, t.cost, t.est_date, t.eft_date
+    ORDER BY t.est_date
+    """
+    res = conn.execute(query, {"project_id": project_id})
+    
+    table = "| Task Name | Duration | Cost | Start Date | End Date |\n"
+    table += "| :--- | :--- | :--- | :--- | :--- |\n"
+    
+    count = 0
+    while res.has_next():
+        row = res.get_next()
+        table += f"| {row[0]} | {row[1]}d | ${row[2]:,.2f} | {row[3]} | {row[4]} |\n"
+        count += 1
+        
+    if count == 0:
+        return f"No tasks found for project {project_id}."
+    return table
+
+@mcp.resource("project://{project_id}/state/export/image")
+def get_project_graph(project_id: str):
+    """Generates a Graphviz PNG diagram of the project dependency graph."""
+    # 1. Fetch nodes and project info
+    proj_res = conn.execute("MATCH (p:Project {id: $id}) RETURN p.name", {"id": project_id})
+    if not proj_res.has_next():
+        return "Error: Project not found."
+    project_name = proj_res.get_next()[0]
+    
+    # 2. Fetch all tasks and their metrics
+    task_res = conn.execute("""
+        MATCH (p:Project {id: $id})-[:CONTAINS]->(t:Task)
+        RETURN t.name, t.duration, t.cost
+    """, {"id": project_id})
+    
+    dot = graphviz.Digraph(comment=f"Project: {project_name}")
+    dot.attr(rankdir='LR')
+    dot.attr('node', shape='box', style='rounded,filled', fillcolor='lightblue', fontname='Helvetica')
+    
+    while task_res.has_next():
+        name, dur, cost = task_res.get_next()
+        label = f"{name}\n({dur}d | ${cost:,.0f})"
+        dot.node(name, label)
+        
+    # 3. Fetch all dependencies
+    dep_res = conn.execute("""
+        MATCH (p:Project {id: $id})-[:CONTAINS]->(s:Task)-[r:DEPENDS_ON]->(t:Task)
+        RETURN s.name, t.name, r.lag
+    """, {"id": project_id})
+    
+    while dep_res.has_next():
+        s, t, lag = dep_res.get_next()
+        label = f"lag={lag}" if lag > 0 else ""
+        dot.edge(s, t, label=label)
+        
+    # 4. Generate PNG bytes
+    png_bytes = dot.pipe(format='png')
+    base64_data = base64.b64encode(png_bytes).decode('utf-8')
+    
+    return {
+        "type": "image",
+        "data": base64_data,
+        "mimeType": "image/png"
+    }
+
 @mcp.tool()
 def create_project(project_id: str, start_date: str, name: str) -> str:
     """
@@ -196,8 +282,13 @@ def create_dependency(source_name: str, target_name: str, lag: int = 0) -> str:
     params = {"source_name": source_name, "target_name": target_name, "lag": lag}
     res = safe_cypher_read(query, params)
     
-    # We need project_id for recalculation. For now, we'd need to find it from the task.
-    # This will be refined in Step 5.
+    # Trigger recalculation: find the project this task belongs to
+    proj_query = "MATCH (p:Project)-[:CONTAINS]->(t:Task {name: $name}) RETURN p.id"
+    proj_res = conn.execute(proj_query, {"name": source_name})
+    if proj_res.has_next():
+        project_id = proj_res.get_next()[0]
+        _recalculate_timeline(project_id)
+        
     return res
 
 @mcp.tool()
