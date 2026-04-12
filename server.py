@@ -20,7 +20,7 @@ def initialize_schema():
     # Node Tables
     node_queries = [
         "CREATE NODE TABLE Project (id STRING, start_date STRING, name STRING, PRIMARY KEY (id))",
-        "CREATE NODE TABLE Task (name STRING, description STRING, duration INT, cost DOUBLE, actual_cost DOUBLE, est_date STRING, eft_date STRING, status STRING, baseline_est_date STRING, baseline_eft_date STRING, baseline_cost DOUBLE, percent_complete INT, PRIMARY KEY (name))",
+        "CREATE NODE TABLE Task (name STRING, description STRING, duration INT, optimistic_duration INT, pessimistic_duration INT, expected_duration DOUBLE, cost DOUBLE, actual_cost DOUBLE, est_date STRING, eft_date STRING, status STRING, baseline_est_date STRING, baseline_eft_date STRING, baseline_cost DOUBLE, percent_complete INT, total_float INT, leveling_delay INT, PRIMARY KEY (name))",
         "CREATE NODE TABLE Resource (name STRING, description STRING, type STRING, cost_rate DOUBLE, PRIMARY KEY (name))",
         "CREATE NODE TABLE Skill (name STRING, description STRING, PRIMARY KEY (name))"
     ]
@@ -47,7 +47,12 @@ def initialize_schema():
         "ALTER TABLE Task ADD baseline_eft_date STRING",
         "ALTER TABLE Task ADD baseline_cost DOUBLE",
         "ALTER TABLE Task ADD actual_cost DOUBLE DEFAULT 0",
-        "ALTER TABLE Task ADD percent_complete INT DEFAULT 0"
+        "ALTER TABLE Task ADD percent_complete INT DEFAULT 0",
+        "ALTER TABLE Task ADD optimistic_duration INT",
+        "ALTER TABLE Task ADD pessimistic_duration INT",
+        "ALTER TABLE Task ADD expected_duration DOUBLE",
+        "ALTER TABLE Task ADD total_float INT DEFAULT 0",
+        "ALTER TABLE Task ADD leveling_delay INT DEFAULT 0"
     ]
     
     for q in migration_queries:
@@ -77,22 +82,29 @@ def safe_cypher_read(query: str, params: dict = None) -> str:
     except Exception as e:
         return f"Kuzu Error: {str(e)}"
 
-def _recalculate_timeline(project_id: str):
+def _recalculate_timeline(project_id: str, repro_set=None):
     """
     Temporal Engine: Topologically sorts tasks and calculates 
     early start/finish dates using numpy.busday_offset.
     Respects HUMAN_LOCKED status and reports critical conflicts.
+    Ph5: Cascades to successor projects if inter-project dependencies change.
     """
+    if repro_set is None:
+        repro_set = set()
+    if project_id in repro_set:
+        return []
+    repro_set.add(project_id)
+
     # 1. Fetch Project Start Date
     proj_res = conn.execute("MATCH (p:Project {id: $id}) RETURN p.start_date", {"id": project_id})
     if not proj_res.has_next():
         return []
     project_start_date = proj_res.get_next()[0]
 
-    # 2. Fetch all tasks in project (including status and current dates)
+    # 2. Fetch all tasks in project
     task_res = conn.execute("""
         MATCH (p:Project {id: $id})-[:CONTAINS]->(t:Task) 
-        RETURN t.name, t.duration, t.status, t.est_date, t.eft_date
+        RETURN t.name, t.duration, t.status, t.est_date, t.eft_date, t.leveling_delay
     """, {"id": project_id})
     tasks = {}
     while task_res.has_next():
@@ -102,24 +114,41 @@ def _recalculate_timeline(project_id: str):
             "status": row[2], 
             "est": row[3], 
             "eft": row[4],
+            "delay": row[5] if row[5] is not None else 0,
             "in_degree": 0, 
             "successors": [], 
             "predecessors": []
         }
 
-    # 3. Fetch dependencies
+    # 3. Fetch dependencies (including inter-project)
+    # Forward dependencies: (this project) -> (any project)
+    # Backward dependencies: (any project) -> (this project)
     dep_res = conn.execute("""
-        MATCH (p:Project {id: $id})-[:CONTAINS]->(s:Task)-[r:DEPENDS_ON]->(t:Task)
-        RETURN s.name, t.name, r.lag
+        MATCH (s:Task)-[r:DEPENDS_ON]->(t:Task)
+        MATCH (p_s:Project)-[:CONTAINS]->(s)
+        MATCH (p_t:Project)-[:CONTAINS]->(t)
+        WHERE p_s.id = $id OR p_t.id = $id
+        RETURN s.name, t.name, r.lag, p_s.id, p_t.id, s.eft_date
     """, {"id": project_id})
+    
     while dep_res.has_next():
-        s_name, t_name, lag = dep_res.get_next()
-        if s_name in tasks and t_name in tasks:
-            tasks[s_name]["successors"].append({"target": t_name, "lag": lag})
-            tasks[t_name]["predecessors"].append({"source": s_name, "lag": lag})
-            tasks[t_name]["in_degree"] += 1
+        s_name, t_name, lag, s_proj, t_proj, s_eft = dep_res.get_next()
+        
+        # Case A: Dependency within this project or starting here
+        if s_proj == project_id and s_name in tasks:
+            tasks[s_name]["successors"].append({"target": t_name, "lag": lag, "target_proj": t_proj})
+            if t_proj == project_id and t_name in tasks:
+                tasks[t_name]["predecessors"].append({"source": s_name, "lag": lag})
+                tasks[t_name]["in_degree"] += 1
+        
+        # Case B: Dependency ending here but starting in another project
+        elif t_proj == project_id and t_name in tasks:
+            # External predecessor is a fixed date constraint for this calculation
+            tasks[t_name]["predecessors"].append({"source": s_name, "lag": lag, "external_eft": s_eft})
+            # We don't increment in_degree for external predecessors because 
+            # we don't calculate them in this pass; they are just 'max' constraints.
 
-    # 4. Topological Sort (Kahn's Algorithm)
+    # 4. Topological Sort (Kahn's Algorithm - internal tasks only)
     queue = deque([name for name, data in tasks.items() if data["in_degree"] == 0])
     sorted_tasks = []
     while queue:
@@ -127,9 +156,10 @@ def _recalculate_timeline(project_id: str):
         sorted_tasks.append(u)
         for edge in tasks[u]["successors"]:
             v = edge["target"]
-            tasks[v]["in_degree"] -= 1
-            if tasks[v]["in_degree"] == 0:
-                queue.append(v)
+            if edge["target_proj"] == project_id: # only traverse internal edges
+                tasks[v]["in_degree"] -= 1
+                if tasks[v]["in_degree"] == 0:
+                    queue.append(v)
 
     # 5. Calendar Calculation
     task_dates = {}
@@ -137,29 +167,38 @@ def _recalculate_timeline(project_id: str):
     
     for name in sorted_tasks:
         task = tasks[name]
-        if not task["predecessors"]:
-            proposed_est = np.busday_offset(project_start_date, 0, roll='following')
-        else:
-            candidate_dates = []
-            for pred in task["predecessors"]:
-                source_eft = task_dates[pred["source"]]["eft"]
-                start_candidate = np.busday_offset(source_eft, 1 + pred["lag"], roll='following')
-                candidate_dates.append(start_candidate)
-            proposed_est = max(candidate_dates)
+        candidate_dates = [np.busday_offset(project_start_date, 0, roll='following')]
+        
+        for pred in task["predecessors"]:
+            if "external_eft" in pred:
+                # Use fixed date from external project
+                if pred["external_eft"]:
+                    ref_eft = pred["external_eft"]
+                else:
+                    ref_eft = project_start_date # Default fallback
+            else:
+                # Use calculated date from this pass
+                ref_eft = task_dates[pred["source"]]["eft"]
+            
+            start_candidate = np.busday_offset(ref_eft, 1 + pred["lag"], roll='following')
+            candidate_dates.append(start_candidate)
+            
+        proposed_est = max(candidate_dates)
+        
+        # Apply leveling_delay (Defect 1 fix)
+        if task["delay"] > 0:
+            proposed_est = np.busday_offset(proposed_est, task["delay"], roll='following')
         
         if task["status"] == "HUMAN_LOCKED" and task["est"]:
             actual_est = np.datetime64(task["est"])
             if proposed_est > actual_est:
                 critical_conflicts.append(f"[CRITICAL CONFLICT] Task '{name}' is locked at {task['est']} but dependencies push it to {proposed_est}")
-            
-            # Keep existing dates
             task_dates[name] = {"est": task["est"], "eft": task["eft"], "locked": True}
         else:
-            # Normal calculation
             eft = np.busday_offset(proposed_est, task["duration"] - 1, roll='following')
             task_dates[name] = {"est": str(proposed_est), "eft": str(eft), "locked": False}
 
-    # 6. Update Database (Skip locked tasks)
+    # 6. Update Database
     for name, dates in task_dates.items():
         if not dates.get("locked"):
             conn.execute("""
@@ -167,7 +206,101 @@ def _recalculate_timeline(project_id: str):
                 SET t.est_date = $est, t.eft_date = $eft
             """, {"name": name, "est": dates["est"], "eft": dates["eft"]})
             
+    # 7. Cascading Trigger: Identify successor projects and recalculate them
+    # Project B's dates might need to change if Project A moved.
+    successor_projects_res = conn.execute("""
+        MATCH (p_s:Project {id: $id})-[:CONTAINS]->(s:Task)-[:DEPENDS_ON]->(t:Task)<-[:CONTAINS]-(p_t:Project)
+        WHERE p_s.id <> p_t.id
+        RETURN DISTINCT p_t.id
+    """, {"id": project_id})
+    while successor_projects_res.has_next():
+        target_pid = successor_projects_res.get_next()[0]
+        critical_conflicts += _recalculate_timeline(target_pid, repro_set)
+            
     return critical_conflicts
+
+def _calculate_float(project_id: str):
+    """
+    Backward Pass Engine: Calculates Late Start/Finish and Total Float.
+    Assumes _recalculate_timeline has already run (Early Start/Finish are set).
+    C2 Fix: Batches all predecessor queries, guards against None eft.
+    H2 Fix: Uses roll='backward' for correct LF subtraction.
+    """
+    # 1. Fetch all tasks and their dependencies in batch (C2: no N+1)
+    task_res = conn.execute("""
+        MATCH (p:Project {id: $id})-[:CONTAINS]->(t:Task)
+        RETURN t.name, t.duration, t.est_date, t.eft_date
+    """, {"id": project_id})
+    tasks = {}
+    while task_res.has_next():
+        row = task_res.get_next()
+        # C2 Fix: Guard against None eft
+        if row[3] is None:
+            continue
+        tasks[row[0]] = {
+            "duration": row[1],
+            "es": row[2],
+            "ef": row[3],
+            "successors": [],
+            "predecessors": [],
+            "out_degree": 0
+        }
+
+    # Batch fetch all dependencies (C2: single query instead of N+1)
+    dep_res = conn.execute("""
+        MATCH (p:Project {id: $id})-[:CONTAINS]->(s:Task)-[r:DEPENDS_ON]->(t:Task)
+        RETURN s.name, t.name, r.lag
+    """, {"id": project_id})
+    while dep_res.has_next():
+        s, t, lag = dep_res.get_next()
+        if s in tasks and t in tasks:
+            tasks[s]["successors"].append({"target": t, "lag": lag})
+            tasks[s]["out_degree"] += 1
+            tasks[t]["predecessors"].append(s)
+
+    # 2. Project Finish Date
+    all_ef = [np.datetime64(t["ef"]) for t in tasks.values()]
+    if not all_ef: return
+    project_finish = max(all_ef)
+
+    # 3. Reverse Topological Sort (Kahn's — process sinks first)
+    queue = deque([name for name, data in tasks.items() if data["out_degree"] == 0])
+    sorted_rev = []
+    while queue:
+        u = queue.popleft()
+        sorted_rev.append(u)
+        for pred_name in tasks[u]["predecessors"]:
+            if pred_name in tasks:
+                tasks[pred_name]["out_degree"] -= 1
+                if tasks[pred_name]["out_degree"] == 0:
+                    queue.append(pred_name)
+
+    # 4. Backward Pass Calculation
+    task_lfls = {}
+    for name in sorted_rev:
+        task = tasks[name]
+        if not task["successors"]:
+            lf = project_finish
+        else:
+            candidates = []
+            for succ in task["successors"]:
+                v_ls = task_lfls[succ["target"]]["ls"]
+                # LF(u) = LS(v) - 1 - lag (in business days)
+                lf_candidate = np.busday_offset(v_ls, -(1 + succ["lag"]), roll='backward')
+                candidates.append(lf_candidate)
+            lf = min(candidates)
+        
+        # H2 Fix: Use roll='backward' for correct business-day subtraction
+        ls = np.busday_offset(lf, -(task["duration"] - 1), roll='backward')
+        task_lfls[name] = {"ls": ls, "lf": lf}
+
+    # 5. Update Total Float in DB
+    for name, dates in task_lfls.items():
+        ef = np.datetime64(tasks[name]["ef"])
+        lf = dates["lf"]
+        # Total Float = LF - EF (in business days)
+        float_days = int(np.busday_count(ef, lf))
+        conn.execute("MATCH (t:Task {name: $name}) SET t.total_float = $f", {"name": name, "f": float_days})
 
 @mcp.tool()
 def lock_task(task_name: str) -> str:
@@ -251,24 +384,27 @@ def get_evm_report(project_id: str) -> str:
         row = res.get_next()
         name, cost, ac, pct, status, b_est, b_eft, b_cost = row
         
+        # Safely handle None values from DB
+        ac = ac if ac is not None else 0.0
+        pct = pct if pct is not None else 0
+        b_cost = b_cost if b_cost is not None else 0.0
+        
         # PV: Planned Value (How much work was scheduled to be done by today?)
-        # For simplicity: if today > baseline_eft, PV = b_cost. If today < b_est, PV = 0. 
-        # Else linear interpolation (simplified).
         pv = 0.0
-        if b_est and b_eft and b_cost:
+        # Safely parse baseline dates
+        if b_est and b_eft and str(b_est) != "None" and str(b_eft) != "None":
             b_est_dt = np.datetime64(b_est)
             b_eft_dt = np.datetime64(b_eft)
             if today >= b_eft_dt:
                 pv = b_cost
             elif today >= b_est_dt:
-                # Simple linear work distribution (calendar days for simplicity in EVM)
                 total_days = (b_eft_dt - b_est_dt).astype(int) + 1
                 elapsed_days = (today - b_est_dt).astype(int) + 1
                 pv = b_cost * (elapsed_days / total_days)
         
         # EV: Earned Value (Value of work actually performed)
         # EV = % Complete * Baseline Cost
-        ev = (pct / 100.0) * (b_cost if b_cost else 0.0)
+        ev = (pct / 100.0) * b_cost
         
         total_pv += pv
         total_ev += ev
@@ -361,15 +497,26 @@ def get_allocation_report(project_id: str) -> str:
     
     for r_name in resources:
         query = """
-        MATCH (r:Resource {name: $name})-[w:WORKS_ON]->(t:Task)
+        MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)<-[w:WORKS_ON]-(r:Resource {name: $name})
         RETURN t.name, t.est_date, t.eft_date, w.allocation
         """
-        assign_nodes = conn.execute(query, {"name": r_name})
+        assign_nodes = conn.execute(query, {"name": r_name, "pid": project_id})
         events = []
         while assign_nodes.has_next():
             t_name, est, eft, alloc = assign_nodes.get_next()
             events.append((est, alloc, t_name, "START"))
-            drop_date = str(np.busday_offset(eft, 1, roll='following'))
+            
+            # Defect 2 Fix: Robust drop_date calculation
+            drop_date = None
+            if eft:
+                try:
+                    drop_date = str(np.busday_offset(eft, 1, roll='following'))
+                except Exception:
+                    pass
+            
+            if not drop_date:
+                drop_date = est # Immediate release fallback
+                
             events.append((drop_date, -alloc, t_name, "END"))
         
         events.sort()
@@ -406,6 +553,80 @@ def get_allocation_report(project_id: str) -> str:
         return report + "No resource allocation conflicts detected. All resources are within capacity."
     return report
 
+@mcp.resource("portfolio://reports/allocation")
+def get_portfolio_allocation_report() -> str:
+    """Generates a global resource allocation conflict report across all projects."""
+    # 1. Fetch all resources in the system
+    res_query = "MATCH (r:Resource) RETURN r.name"
+    res_nodes = conn.execute(res_query)
+    resources = []
+    while res_nodes.has_next():
+        resources.append(res_nodes.get_next()[0])
+    
+    report = "# Global Portfolio Allocation Conflict Report\n\n"
+    conflicts_found = False
+    
+    for r_name in resources:
+        query = """
+        MATCH (r:Resource {name: $name})-[w:WORKS_ON]->(t:Task)
+        MATCH (p:Project)-[:CONTAINS]->(t)
+        RETURN t.name, t.est_date, t.eft_date, w.allocation, p.id
+        """
+        assign_nodes = conn.execute(query, {"name": r_name})
+        events = []
+        while assign_nodes.has_next():
+            t_name, est, eft, alloc, pid = assign_nodes.get_next()
+            label = f"{t_name} ({pid})"
+            events.append((est, alloc, label, "START"))
+            
+            # Defect 2 Fix: Robust drop_date calculation
+            drop_date = None
+            if eft:
+                try:
+                    drop_date = str(np.busday_offset(eft, 1, roll='following'))
+                except Exception:
+                    pass
+            
+            if not drop_date:
+                drop_date = est # Immediate release fallback
+                
+            events.append((drop_date, -alloc, label, "END"))
+        
+        if not events: continue
+        events.sort()
+        
+        current_alloc = 0
+        active_tasks = set()
+        conflict_windows = []
+        
+        for i in range(len(events)):
+            date, delta, task_label, event_type = events[i]
+            current_alloc += delta
+            if event_type == "START": active_tasks.add(task_label)
+            else: active_tasks.remove(task_label)
+            
+            if current_alloc > 100:
+                if i + 1 < len(events):
+                    next_date = events[i+1][0]
+                    if next_date != date:
+                        conflict_windows.append({
+                            "window": f"{date} to {next_date}",
+                            "total": current_alloc,
+                            "tasks": list(active_tasks)
+                        })
+        
+        if conflict_windows:
+            conflicts_found = True
+            report += f"## Resource: {r_name}\n"
+            for conflict in conflict_windows:
+                report += f"- **Conflict Window**: {conflict['window']} (Allocation: {conflict['total']}%)\n"
+                report += f"  - **Tasks Involved**: {', '.join(conflict['tasks'])}\n"
+            report += "\n"
+            
+    if not conflicts_found:
+        return report + "No global resource allocation conflicts detected."
+    return report
+
 def _check_over_allocation(resource_name: str) -> str:
     """Checks if a resource is over-allocated (>100%) in any date window."""
     query = """
@@ -425,11 +646,19 @@ def _check_over_allocation(resource_name: str) -> str:
     for est, eft, alloc in intervals:
         events.append((est, alloc))
         # Release happens the next business day after eft
-        try:
-            drop_date = str(np.busday_offset(eft, 1, roll='following'))
-            events.append((drop_date, -alloc))
-        except:
-            pass # Handle invalid dates
+        # Defect 2 Fix: Robust drop_date calculation (no bare except: pass)
+        drop_date = None
+        if eft:
+            try:
+                drop_date = str(np.busday_offset(eft, 1, roll='following'))
+            except Exception as e:
+                # Log warning to console as requested
+                print(f"Sweep-line Warning: Failed to calculate drop_date for {eft}: {e}")
+        
+        if not drop_date:
+            drop_date = est # Immediate release fallback
+            
+        events.append((drop_date, -alloc))
         
     # Sort events by date
     events.sort()
@@ -453,7 +682,10 @@ def get_schema() -> str:
     schema = {
         "nodes": {
             "Project": ["id", "start_date", "name"],
-            "Task": ["name", "description", "duration", "cost", "actual_cost", "est_date", "eft_date", "status", "baseline_est_date", "baseline_eft_date", "baseline_cost", "percent_complete"],
+            "Task": ["name", "description", "duration", "optimistic_duration", "pessimistic_duration",
+                     "expected_duration", "cost", "actual_cost", "est_date", "eft_date", "status",
+                     "baseline_est_date", "baseline_eft_date", "baseline_cost",
+                     "percent_complete", "total_float", "leveling_delay"],
             "Resource": ["name", "description", "type", "cost_rate"],
             "Skill": ["name", "description"]
         },
@@ -544,21 +776,38 @@ def create_project(project_id: str, start_date: str, name: str) -> str:
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", start_date):
         return "Error: start_date must be in YYYY-MM-DD format."
     
-    query = "MERGE (p:Project {id: $id, start_date: $start_date, name: $name})"
+    query = """
+    MERGE (p:Project {id: $id})
+    SET p.start_date = $start_date, p.name = $name
+    """
     params = {"id": project_id, "start_date": start_date, "name": name}
     return safe_cypher_read(query, params)
 
 @mcp.tool()
-def add_task(project_id: str, name: str, duration: int, cost: float, description: str = "") -> str:
+def add_task(project_id: str, name: str, duration: int, cost: float, description: str = "", optimistic: int = None, pessimistic: int = None) -> str:
     """
-    Adds a task to a project and initializes its dates.
+    Adds a task to a project and initializes its dates and PERT estimates.
     """
-    # Cypher to fetch project start_date and create task linked to project
+    # Default PERT estimates to the provided duration if not specified
+    opt = optimistic if optimistic is not None else duration
+    pess = pessimistic if pessimistic is not None else duration
+    
+    # MERGE on name (PK) only, then SET all other properties to avoid duplicate nodes
     query = """
     MATCH (p:Project {id: $project_id})
-    MERGE (t:Task {name: $name, description: $description, duration: $duration, cost: $cost, 
-                   est_date: p.start_date, eft_date: p.start_date, 
-                   status: 'AI_DRAFT', percent_complete: 0})
+    MERGE (t:Task {name: $name})
+    SET t.description = $description,
+        t.duration = $duration,
+        t.optimistic_duration = $opt,
+        t.pessimistic_duration = $pess,
+        t.cost = $cost,
+        t.actual_cost = coalesce(t.actual_cost, 0.0),
+        t.est_date = coalesce(t.est_date, p.start_date),
+        t.eft_date = coalesce(t.eft_date, p.start_date),
+        t.status = coalesce(t.status, 'AI_DRAFT'),
+        t.percent_complete = coalesce(t.percent_complete, 0),
+        t.total_float = coalesce(t.total_float, 0),
+        t.leveling_delay = coalesce(t.leveling_delay, 0)
     MERGE (p)-[:CONTAINS]->(t)
     RETURN t.name
     """
@@ -566,6 +815,8 @@ def add_task(project_id: str, name: str, duration: int, cost: float, description
         "project_id": project_id,
         "name": name,
         "duration": duration,
+        "opt": opt,
+        "pess": pess,
         "cost": cost,
         "description": description
     }
@@ -581,21 +832,16 @@ def create_dependency(source_name: str, target_name: str, lag: int = 0) -> str:
     Creates a dependency between two tasks (Source -> Target).
     Enforces Law I: No Circular Dependencies.
     """
-    # Gate 1: Cycle Check
-    check_query = "MATCH path=(t:Task {name: $target_name})-[*]->(s:Task {name: $source_name}) RETURN count(path) as count"
-    check_params = {"source_name": source_name, "target_name": target_name}
-    check_res = safe_cypher_read(check_query, check_params)
-    
-    # Kuzu returns strings like '[[1]]' or error messages.
-    if "Kuzu Error" in check_res:
-        return check_res
-        
+    # Gate 1: Cycle Check (Extract exact count natively, avoid brittle string matching)
+    check_query = "MATCH path=(t:Task {name: $target_name})-[*]->(s:Task {name: $source_name}) RETURN count(path)"
     try:
-        # Check if count > 0. safe_cypher_read returns str(rows).
-        if "[1]" in check_res or "[[1]]" in check_res:
-            return "Law I Violation: Circular Dependency Detected."
-    except:
-        pass
+        check_res = conn.execute(check_query, {"source_name": source_name, "target_name": target_name})
+        if check_res.has_next():
+            path_count = check_res.get_next()[0]
+            if path_count > 0:
+                return "Law I Violation: Circular Dependency Detected."
+    except Exception as e:
+         return f"Kuzu Error during Cycle Check: {str(e)}"
 
     # Gate 2: Create Edge
     query = """
@@ -603,17 +849,233 @@ def create_dependency(source_name: str, target_name: str, lag: int = 0) -> str:
     MERGE (a)-[r:DEPENDS_ON {lag: $lag}]->(b)
     RETURN r.lag
     """
-    params = {"source_name": source_name, "target_name": target_name, "lag": lag}
-    res = safe_cypher_read(query, params)
-    
-    # Trigger recalculation: find the project this task belongs to
+    res = safe_cypher_read(query, {"source_name": source_name, "target_name": target_name, "lag": lag})
+      
+    # Trigger recalculation: Correctly fetch the project_id using the source_name
+    proj_query = "MATCH (p:Project)-[:CONTAINS]->(t:Task {name: $name}) RETURN p.id"
+    proj_res = conn.execute(proj_query, {"name": source_name})
     if proj_res.has_next():
         project_id = proj_res.get_next()[0]
         conflicts = _recalculate_timeline(project_id)
         if conflicts:
             res += "\n" + "\n".join(conflicts)
-            
+              
     return res
+
+@mcp.tool()
+def update_estimates(task_name: str, optimistic: int, pessimistic: int) -> str:
+    """Updates the 3-point estimates for a task's duration."""
+    res = conn.execute("""
+        MATCH (t:Task {name: $name})
+        SET t.optimistic_duration = $opt, t.pessimistic_duration = $pess
+        RETURN t.name
+    """, {"name": task_name, "opt": optimistic, "pess": pessimistic})
+    if res.has_next():
+        return f"PERT estimates updated for task '{task_name}'."
+    return f"Error: Task '{task_name}' not found."
+
+@mcp.tool()
+def run_pert_analysis(project_id: str) -> str:
+    """
+    Runs PERT analysis for all tasks in a project.
+    Expected Duration = (Optimistic + 4*Most_Likely + Pessimistic) / 6
+    """
+    query = """
+    MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
+    SET t.expected_duration = (CAST(t.optimistic_duration AS DOUBLE) + (4.0 * CAST(t.duration AS DOUBLE)) + CAST(t.pessimistic_duration AS DOUBLE)) / 6.0
+    RETURN count(t)
+    """
+    res = conn.execute(query, {"pid": project_id})
+    if res.has_next():
+        count = res.get_next()[0]
+        return f"PERT analysis complete for {count} tasks in project '{project_id}'."
+    return f"No tasks found for project '{project_id}'."
+
+@mcp.resource("project://{project_id}/reports/risk")
+def get_risk_report(project_id: str) -> str:
+    """Generates a PERT risk analysis report, highlighting high-variance tasks."""
+    query = """
+    MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
+    RETURN t.name, t.duration, t.optimistic_duration, t.pessimistic_duration, t.expected_duration
+    """
+    res = conn.execute(query, {"pid": project_id})
+    
+    tasks = []
+    while res.has_next():
+        row = res.get_next()
+        name, m, o, p, e = row
+        # Variance = ((P - O) / 6)^2
+        variance = ((p - o) / 6.0)**2 if p is not None and o is not None else 0.0
+        tasks.append({
+            "name": name, "m": m, "o": o, "p": p, "e": e, "var": variance
+        })
+    
+    if not tasks:
+        return f"No task data found for project {project_id}."
+        
+    tasks.sort(key=lambda x: x["var"], reverse=True)
+    
+    report = f"# PERT Risk Analysis: Project {project_id} 🎲\n\n"
+    report += "| Task | Most Likely | Optimistic | Pessimistic | Expected (PERT) | Variance |\n"
+    report += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    
+    for t in tasks:
+        e_str = f"{t['e']:.2f}" if t['e'] is not None else "N/A"
+        report += f"| {t['name']} | {t['m']}d | {t['o']}d | {t['p']}d | {e_str}d | {t['var']:.2f} |\n"
+        
+    report += "\n### Risk Interpretation\n"
+    report += "- **High Variance (> 1.0)**: High uncertainty. Task duration is unpredictable.\n"
+    report += "- **Low Variance (< 0.2)**: High certainty. Task is well-understood.\n"
+    
+    return report
+
+@mcp.tool()
+def clone_scenario(source_project_id: str, new_scenario_id: str) -> str:
+    """
+    Clones a project, its tasks, dependencies, and resource assignments into a sandbox.
+    Prefixes the task names with the new_scenario_id to maintain Primary Key uniqueness.
+    """
+    # 1. Create the new project clone
+    query_proj = """
+    MATCH (p:Project {id: $src})
+    MERGE (new_p:Project {id: $dest, start_date: p.start_date, name: p.name + ' (Clone)'})
+    RETURN new_p.id
+    """
+    res = conn.execute(query_proj, {"src": source_project_id, "dest": new_scenario_id})
+    if not res.has_next():
+        return f"Error: Source project '{source_project_id}' not found."
+
+    # 2. Clone Tasks and CONTAINS edges
+    query_tasks = """
+    MATCH (p:Project {id: $src})-[:CONTAINS]->(t:Task)
+    MATCH (new_p:Project {id: $dest})
+    MERGE (new_t:Task {
+        name: $dest + '_' + t.name, 
+        description: t.description, 
+        duration: t.duration, 
+        optimistic_duration: t.optimistic_duration,
+        pessimistic_duration: t.pessimistic_duration,
+        expected_duration: t.expected_duration,
+        cost: t.cost, 
+        actual_cost: t.actual_cost,
+        est_date: t.est_date, 
+        eft_date: t.eft_date, 
+        baseline_est_date: t.baseline_est_date,
+        baseline_eft_date: t.baseline_eft_date,
+        baseline_cost: t.baseline_cost,
+        percent_complete: t.percent_complete,
+        status: t.status,
+        total_float: t.total_float,
+        leveling_delay: t.leveling_delay
+    })
+    MERGE (new_p)-[:CONTAINS]->(new_t)
+    """
+    conn.execute(query_tasks, {"src": source_project_id, "dest": new_scenario_id})
+
+    # 3. Clone DEPENDS_ON edges
+    query_deps = """
+    MATCH (p:Project {id: $src})-[:CONTAINS]->(s:Task)-[r:DEPENDS_ON]->(t:Task)
+    MATCH (new_s:Task {name: $dest + '_' + s.name})
+    MATCH (new_t:Task {name: $dest + '_' + t.name})
+    MERGE (new_s)-[:DEPENDS_ON {lag: r.lag}]->(new_t)
+    """
+    conn.execute(query_deps, {"src": source_project_id, "dest": new_scenario_id})
+      
+    # 4. Clone WORKS_ON (Resource assignments)
+    query_works = """
+    MATCH (p:Project {id: $src})-[:CONTAINS]->(t:Task)<-[w:WORKS_ON]-(r:Resource)
+    MATCH (new_t:Task {name: $dest + '_' + t.name})
+    MERGE (r)-[:WORKS_ON {allocation: w.allocation}]->(new_t)
+    """
+    conn.execute(query_works, {"src": source_project_id, "dest": new_scenario_id})
+
+    return f"Scenario cloned successfully. You can now safely test changes on project '{new_scenario_id}'."
+
+@mcp.tool()
+def export_to_kanban(project_id: str) -> str:
+    """
+    Exports project tasks in a JSON format compatible with Kanban systems (Jira/Trello).
+    """
+    query = """
+    MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
+    OPTIONAL MATCH (t)<-[w:WORKS_ON]-(r:Resource)
+    RETURN t.name, t.status, t.est_date, t.eft_date, collect(r.name), t.description
+    """
+    res = conn.execute(query, {"pid": project_id})
+    
+    cards = []
+    while res.has_next():
+        name, status, est, eft, r_names, desc = res.get_next()
+        # Handle Kuzu's list aggregation 
+        assignees = ", ".join([r for r in r_names if r]) if r_names else "Unassigned"
+        
+        cards.append({
+            "title": name,
+            "status": status,
+            "start": est,
+            "due": eft,
+            "assignees": assignees,
+            "description": desc
+        })
+    
+    return json.dumps({"project_id": project_id, "cards": cards}, indent=2)
+
+@mcp.tool()
+def generate_briefing_webhook(project_id: str) -> str:
+    """
+    Generates a high-density Markdown briefing suitable for a Slack/Teams webhook.
+    Combines Critical Path, Budget, and EVM data.
+    """
+    cp = get_critical_path(project_id)
+    evm = get_evm_report(project_id)
+    budget = get_budget_report(project_id)
+    
+    # Condensed version
+    briefing = f"🚀 **Project Pulse: {project_id}**\n\n"
+    
+    # Extract SPI/CPI from EVM
+    spi = re.search(r"SPI\)\*\*: ([\d\.]+)", evm)
+    cpi = re.search(r"CPI\)\*\*: ([\d\.]+)", evm)
+    
+    briefing += "📊 **Metrics**\n"
+    briefing += f"- SPI: {spi.group(1) if spi else '1.00'}\n"
+    briefing += f"- CPI: {cpi.group(1) if cpi else '1.00'}\n\n"
+    
+    briefing += "🛤️ **Critical Path**\n"
+    briefing += f"{cp}\n\n"
+    
+    briefing += "💰 **Budget Summary**\n"
+    # Extract Total Budget from report
+    total = re.search(r"\*\*TOTAL PROJECT BUDGET\*\* \| \| \| \*\*(\$[\d\.,]+)\*\*", budget)
+    briefing += f"Total Forecast: {total.group(1) if total else 'Unknown'}\n"
+    
+    return briefing
+
+@mcp.tool()
+def generate_agent_sub_prompt(task_name: str) -> str:
+    """
+    Generates a specialized system prompt for a sub-agent to execute a specific task.
+    Uses task metadata, dependencies, and required skills.
+    """
+    query = """
+    MATCH (t:Task {name: $name})
+    OPTIONAL MATCH (t)-[:REQUIRES_SKILL]->(s:Skill)
+    RETURN t.description, t.duration, collect(s.name)
+    """
+    res = conn.execute(query, {"name": task_name})
+    if not res.has_next():
+        return f"Error: Task '{task_name}' not found."
+    
+    desc, dur, skills = res.get_next()
+    skills_str = ", ".join(skills) if skills else "Generalist Skills"
+    
+    prompt = f"YOU ARE AN EXPERT AGENT specializing in: {skills_str}.\n"
+    prompt += f"OBJECTIVE: Execute the task '{task_name}'.\n"
+    prompt += f"SCOPE: {desc}\n"
+    prompt += f"CONSTRAINTS: You have a hard deadline of {dur} working days.\n"
+    prompt += "INSTRUCTION: Provide the implementation plan first, then execute only upon approval."
+    
+    return f"--- SUB-AGENT PROMPT ---\n{prompt}\n--- END PROMPT ---"
 
 @mcp.tool()
 def add_resource(name: str, resource_type: str, cost_rate: float, description: str = "") -> str:
@@ -730,6 +1192,105 @@ def check_timeline(project_id: str) -> str:
     return f"Timeline for project '{project_id}' is valid and up-to-date."
 
 @mcp.tool()
+def auto_level_schedule(project_id: str) -> str:
+    """
+    Automatic Resource Leveler: Resolves resource over-allocations by shifting 
+    tasks with positive float. Adheres to Law of Optimization.
+    """
+    shifts = []
+    max_iterations = 20 # Prevent infinite loops
+    
+    for _ in range(max_iterations):
+        # 1. Update dates and floats
+        _recalculate_timeline(project_id)
+        _calculate_float(project_id)
+        
+        # 2. Extract allocation conflicts
+        # We reuse the logic from get_allocation_report but in a more machine-readable way
+        res_query = """
+        MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)<-[w:WORKS_ON]-(r:Resource)
+        RETURN DISTINCT r.name
+        """
+        res_it = conn.execute(res_query, {"pid": project_id})
+        resources = []
+        while res_it.has_next():
+            resources.append(res_it.get_next()[0])
+        
+        conflict_found = False
+        for r_name in resources:
+            query = """
+            MATCH (r:Resource {name: $name})-[w:WORKS_ON]->(t:Task)
+            MATCH (p:Project)-[:CONTAINS]->(t)
+            RETURN t.name, t.est_date, t.eft_date, w.allocation, t.status, t.total_float, p.id
+            """
+            tasks_data = []
+            assign_it = conn.execute(query, {"name": r_name})
+            while assign_it.has_next():
+                tasks_data.append(assign_it.get_next())
+            
+            # Sweep-line to find first conflict date
+            events = []
+            for t_name, est, eft, alloc, status, t_float, t_pid in tasks_data:
+                events.append((est, alloc, t_name, "START", status, t_float, t_pid))
+                # M1 Fix: Guard against None eft (same fix as other allocation functions)
+                drop_date = None
+                if eft:
+                    try:
+                        drop_date = str(np.busday_offset(eft, 1, roll='following'))
+                    except Exception:
+                        pass
+                if not drop_date:
+                    drop_date = est  # Immediate release fallback
+                events.append((drop_date, -alloc, t_name, "END", status, t_float, t_pid))
+            
+            events.sort()
+            current_alloc = 0
+            active_tasks = {} # name -> {status, float, pid}
+            
+            for i in range(len(events)):
+                date, delta, t_name, ev_type, status, t_float, t_pid = events[i]
+                current_alloc += delta
+                if ev_type == "START": active_tasks[t_name] = {"status": status, "float": t_float, "pid": t_pid}
+                else: active_tasks.pop(t_name, None)
+                
+                if current_alloc > 100:
+                    # Conflict at 'date'!
+                    # Heuristic: Pick task with highest float that isn't locked or float=0
+                    # IMPORTANT: We only shift tasks in the CURRENT project_id 
+                    # to keep the solver focused, but we see conflicts from other projects.
+                    candidates = [
+                        (name, data["float"]) for name, data in active_tasks.items() 
+                        if data["status"] != "HUMAN_LOCKED" and data["float"] > 0 and data["pid"] == project_id
+                    ]
+                    
+                    if candidates:
+                        # Sort by float descending
+                        candidates.sort(key=lambda x: x[1], reverse=True)
+                        target_task, current_float = candidates[0]
+                        
+                        # Apply 1-day delay (Defect 1 Fix)
+                        # We increment the task's inherent leveling_delay instead of modifying edges.
+                        # This works for all tasks, including root tasks.
+                        conn.execute("""
+                            MATCH (t:Task {name: $name})
+                            SET t.leveling_delay = coalesce(t.leveling_delay, 0) + 1
+                        """, {"name": target_task})
+                        
+                        shifts.append(f"Shifted '{target_task}' by 1 day to resolve {r_name} overload at {date}")
+                        conflict_found = True
+                        break # Recalculate everything
+            
+            if conflict_found: break
+        
+        if not conflict_found:
+            break
+            
+    if not shifts:
+        return "No automated shifts were necessary or possible (all conflicts might be on Critical Path or Locked)."
+    
+    return "Schedule Leveled Successfully:\n" + "\n".join(shifts)
+
+@mcp.tool()
 def get_critical_path(project_id: str) -> str:
     """
     Identifies the critical path of the project.
@@ -756,12 +1317,15 @@ def get_critical_path(project_id: str) -> str:
     seeds = conn.execute(query, {"id": project_id, "finish": proj_finish})
     cp_tasks = set()
     stack = []
+    seeds_list = []  # H3: track seed tasks to anchor the forward order
     while seeds.has_next():
         name = seeds.get_next()[0]
         cp_tasks.add(name)
         stack.append(name)
+        seeds_list.append(name)
         
-    # Backward trace
+    # Backward trace — collect CP tasks maintaining insertion order
+    cp_ordered = []  # Will be built in reverse (project-end first)
     while stack:
         current = stack.pop()
         # Fetch current Task EST
@@ -782,8 +1346,13 @@ def get_critical_path(project_id: str) -> str:
                 if s_name not in cp_tasks:
                     cp_tasks.add(s_name)
                     stack.append(s_name)
+                    cp_ordered.append(s_name)
 
-    return f"Critical Path for {project_id}: " + " -> ".join(sorted(list(cp_tasks)))
+    # H3 Fix: Output in topological (forward) order — reverse the backward trace
+    # Seeds are endpoints, cp_ordered are their predecessors discovered backward
+    # Reverse cp_ordered and append seeds at the end for correct forward order
+    forward_path = list(reversed(cp_ordered)) + list(seeds_list)
+    return f"Critical Path for {project_id}: " + " -> ".join(forward_path)
 
 @mcp.tool()
 def ping() -> str:
@@ -794,6 +1363,32 @@ def ping() -> str:
 def get_system_info() -> str:
     """Returns basic server status."""
     return "Engine Status: Awaiting Phase 1 Database Initialization."
+
+@mcp.resource("system://constitution")
+def get_constitution() -> str:
+    """Returns the Symbolic Standard and Laws of Logic for the Project Engine."""
+    constitution = """
+# mcp-project-logic Constitution (Phase 4 Extended)
+
+## 1. The Symbolic Standard
+- SKILL Nodes: 🔨
+- TASK Nodes: 🪏
+- RESOURCE Nodes: 👤
+- CALENDAR/DATES: 📅
+- RISK/PERT Nodes: 🎲
+- FLOAT/SLACK: 〰️
+
+## 2. Fundamental Logic & States
+- Law I: The Law of Non-Circularity (No cycles)
+- Law II: The Law of Temporal Sequence (Working day calendar)
+- Law III: The Law of Financial Tracking (Cost summation)
+- Law IV: The Law of Optimization (AI may shift AI_DRAFT tasks within their Total Float to resolve conflicts)
+
+## 3. State Monitors
+- Resource Integrity: Verify resource existence and skill possession.
+- Allocation Check: Monitor for >100% resource load across date windows.
+    """
+    return constitution
 
 if __name__ == "__main__":
     # By default, mcp.run() uses stdio transport
