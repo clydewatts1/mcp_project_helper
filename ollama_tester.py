@@ -116,7 +116,7 @@ async def _read_dag(project_id: str) -> bytes:
 
 
 # ─── LLM loop (runs inside a single MCP session) ─────────────────────────────
-async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: list):
+async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: list, selected_model: str = "llama3.2"):
     """
     Shared Ollama chat + tool-execution loop.
     Appends (role, content, tool_name?) tuples to output_queue so the
@@ -150,7 +150,7 @@ async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: l
                     break
 
                 response = ollama.chat(
-                    model="llama3.2", messages=messages, tools=tools
+                    model=selected_model, messages=messages, tools=tools
                 )
                 resp_msg = response.get("message", {})
                 messages.append(resp_msg)
@@ -191,7 +191,7 @@ async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: l
     return messages
 
 
-def run_llm_loop(system_prompt: str):
+def run_llm_loop(system_prompt: str, selected_model: str = "llama3.2"):
     """Synchronous wrapper: runs the LLM loop in a thread and renders output."""
     output_queue = []
     messages = list(st.session_state.messages)
@@ -199,7 +199,7 @@ def run_llm_loop(system_prompt: str):
     with st.spinner("🤖 Ollama is working..."):
         try:
             updated_messages = run_sync(
-                _llm_loop_async(messages, [], output_queue)
+                _llm_loop_async(messages, [], output_queue, selected_model)
             )
             st.session_state.messages = updated_messages
         except Exception as e:
@@ -238,17 +238,28 @@ def render_query_result(raw):
         st.code(str(text), language="text")
 
 
+def get_available_models():
+    try:
+        resp = ollama.list()
+        models = resp.get('models', []) if isinstance(resp, dict) else getattr(resp, 'models', [])
+        return [m.get('model') if isinstance(m, dict) else m.model for m in models]
+    except Exception:
+        return ["llama3.2"]
+
 # ─── Main App ─────────────────────────────────────────────────────────────────
 def main():
+    st.set_page_config(page_title="MCP Dev Console", page_icon="🪏")
     st.title("🪏 mcp-project-logic: Dev Console")
 
     if "messages" not in st.session_state:
         st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if "run_triggered" not in st.session_state:
-        st.session_state.run_triggered = False
 
     # ── Sidebar ─────────────────────────────────────────────
     st.sidebar.title("🛠️ MCP Dev Console")
+    
+    available_models = get_available_models()
+    selected_model = st.sidebar.selectbox("🤖 Ollama Model", available_models, index=available_models.index("llama3.2") if "llama3.2" in available_models else 0)
+    
     view = st.sidebar.radio(
         "Navigation",
         ["🧪 Automated Scenarios", "💬 Interactive Chat", "🗄️ Database Inspector"],
@@ -292,7 +303,7 @@ def main():
                         st.session_state.messages.append({"role": "user", "content": step_text})
                         st.chat_message("user").write(step_text)
                         
-                        run_llm_loop(SYSTEM_PROMPT)
+                        run_llm_loop(SYSTEM_PROMPT, selected_model)
                         
         st.markdown("---")
         st.subheader("Scenario History")
@@ -319,7 +330,7 @@ def main():
         if prompt := st.chat_input("Enter a project command or question..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
             st.chat_message("user").write(prompt)
-            run_llm_loop(SYSTEM_PROMPT)
+            run_llm_loop(SYSTEM_PROMPT, selected_model)
 
     # ── Database Inspector ───────────────────────────────────
     elif view == "🗄️ Database Inspector":

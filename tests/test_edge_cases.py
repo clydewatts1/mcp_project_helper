@@ -5,9 +5,8 @@ def test_invalid_resource_assignment(isolated_server):
     s.create_project("P_ERR", "2026-01-01", "Error Project")
     s.add_task("P_ERR", "T1", 1, 100.0)
     
-    # Ghost is not a resource
-    with pytest.raises(ValueError, match="Resource 'Ghost' does not exist"):
-        s.assign_resource("Ghost", "T1", 100)
+    res = s.assign_resource("Ghost", "T1", 100)
+    assert "You MUST call the 'add_resource' tool" in res
 
 def test_invalid_date_format(isolated_server):
     s = isolated_server

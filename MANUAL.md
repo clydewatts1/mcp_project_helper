@@ -94,3 +94,11 @@ These URIs can be fetched by the LLM at any time to gain immediate context about
 * portfolio://reports/allocation: Global sweep-line analysis detecting bottlenecks across *all* active projects in the database.  
 * project://{project_id}/reports/evm: Earned Value Management report displaying Planned Value (PV), Earned Value (EV), Actual Cost (AC), SPI, and CPI.  
 * project://{project_id}/reports/risk: PERT analysis report highlighting tasks with dangerously high statistical variance on the timeline.
+
+### **Dynamic Custom Reports (Phase 16)**
+
+The project engine permits autonomous LLM workers to author and register their own repeatable analytics onto the graph database.
+
+* `custom://reports`: Lists all user/AI registered custom analytical reports and their operational health status.
+* **Relevant Tools**: `register_custom_report`, `run_custom_report`, `debug_custom_report`.
+* **Security Constraints**: Reports are validated for syntax upon registration (`LIMIT 1`). Execution of structural mutation commands (e.g. `CREATE`, `SET`) are universally blocked.

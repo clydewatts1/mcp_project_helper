@@ -22,7 +22,8 @@ def initialize_schema():
         "CREATE NODE TABLE Project (id STRING, start_date STRING, name STRING, PRIMARY KEY (id))",
         "CREATE NODE TABLE Task (name STRING, description STRING, duration INT, optimistic_duration INT, pessimistic_duration INT, expected_duration DOUBLE, cost DOUBLE, actual_cost DOUBLE, est_date STRING, eft_date STRING, status STRING, baseline_est_date STRING, baseline_eft_date STRING, baseline_cost DOUBLE, percent_complete INT, total_float INT, leveling_delay INT, PRIMARY KEY (name))",
         "CREATE NODE TABLE Resource (name STRING, description STRING, type STRING, cost_rate DOUBLE, PRIMARY KEY (name))",
-        "CREATE NODE TABLE Skill (name STRING, description STRING, PRIMARY KEY (name))"
+        "CREATE NODE TABLE Skill (name STRING, description STRING, PRIMARY KEY (name))",
+        "CREATE NODE TABLE CustomReport (name STRING, description STRING, cypher_query STRING, last_error STRING, PRIMARY KEY (name))"
     ]
     
     # Edge Tables
@@ -1835,6 +1836,109 @@ def get_constitution() -> str:
 - Allocation Check: Monitor for >100% resource load across date windows.
     """
     return constitution
+
+# ─── Custom Dynamic Reports (Phase 16) ───────────────────────────────────────
+
+@mcp.tool()
+def register_custom_report(name: str, description: str, cypher_query: str) -> str:
+    """
+    Allows the AI to save a custom analytical query as a reusable report.
+    SECURITY: The query MUST be read-only (MATCH/RETURN/WITH). Mutating commands are blocked.
+    """
+    # 1. Security Gate: Block all mutation keywords
+    forbidden_keywords = ["CREATE", "MERGE", "SET", "DELETE", "DROP", "ALTER", "REMOVE"]
+    query_upper = cypher_query.upper()
+    if any(keyword in query_upper for keyword in forbidden_keywords):
+        return f"Security Violation: Query rejected. Custom reports cannot contain mutating keywords like CREATE or SET."
+        
+    # 2. Syntax Validation: Try running it with a LIMIT 1 to catch typos instantly
+    test_query = f"{cypher_query} LIMIT 1"
+    last_error = ""
+    try:
+        conn.execute(test_query)
+    except Exception as e:
+        last_error = f"Syntax Error during registration: {str(e)}"
+        
+    # 3. Save to Database
+    save_query = """
+    MERGE (r:CustomReport {name: $name})
+    SET r.description = $desc,
+        r.cypher_query = $query,
+        r.last_error = $error
+    RETURN r.name
+    """
+    conn.execute(save_query, {"name": name, "desc": description, "query": cypher_query, "error": last_error})
+    
+    if last_error:
+        return f"Report '{name}' saved, but it contains a syntax error. Use debug_custom_report to view the error log."
+    return f"Success! Custom report '{name}' has been registered and is ready to run."
+
+@mcp.tool()
+def run_custom_report(name: str) -> str:
+    """
+    Executes a previously saved custom report by name.
+    """
+    # 1. Fetch the query
+    res = conn.execute("MATCH (r:CustomReport {name: $name}) RETURN r.cypher_query", {"name": name})
+    if not res.has_next():
+        return f"Error: Custom report '{name}' not found."
+        
+    query = res.get_next()[0]
+    
+    # 2. Execute and trap errors
+    try:
+        result_set = conn.execute(query)
+        rows = []
+        while result_set.has_next():
+            rows.append(result_set.get_next())
+            
+        # Clear any previous errors on success
+        conn.execute("MATCH (r:CustomReport {name: $name}) SET r.last_error = ''", {"name": name})
+        
+        if not rows:
+            return "Report executed successfully, but returned 0 rows."
+        return str(rows)
+        
+    except Exception as e:
+        error_msg = str(e)
+        # Log the error to the database for later debugging
+        conn.execute("MATCH (r:CustomReport {name: $name}) SET r.last_error = $err", {"name": name, "err": error_msg})
+        return f"Execution Failed. Error logged to database. Please run debug_custom_report('{name}') to investigate."
+
+@mcp.tool()
+def debug_custom_report(name: str) -> str:
+    """
+    Returns the exact Cypher query and the last recorded error log for a custom report.
+    Use this to troubleshoot why a run_custom_report call failed.
+    """
+    res = conn.execute("MATCH (r:CustomReport {name: $name}) RETURN r.cypher_query, r.last_error", {"name": name})
+    if not res.has_next():
+        return f"Error: Custom report '{name}' not found."
+        
+    query, last_error = res.get_next()
+    
+    debug_info = f"--- DEBUG LOG FOR: {name} ---\n"
+    debug_info += f"Query:\n{query}\n\n"
+    debug_info += f"Last Recorded Error:\n{last_error if last_error else 'No errors recorded. Query is healthy.'}\n"
+    return debug_info
+
+@mcp.resource("custom://reports")
+def list_custom_reports() -> str:
+    """Returns a list of all registered custom AI reports."""
+    res = conn.execute("MATCH (r:CustomReport) RETURN r.name, r.description, r.last_error")
+    
+    table = "| Report Name | Description | Status |\n| :--- | :--- | :--- |\n"
+    count = 0
+    while res.has_next():
+        name, desc, err = res.get_next()
+        status = "❌ Failing" if err else "✅ Healthy"
+        table += f"| {name} | {desc} | {status} |\n"
+        count += 1
+        
+    if count == 0:
+        return "No custom reports have been registered yet."
+    return table
+
 
 if __name__ == "__main__":
     # By default, mcp.run() uses stdio transport
