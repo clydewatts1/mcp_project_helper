@@ -78,9 +78,25 @@ def safe_cypher_read(query: str, params: dict = None) -> str:
         rows = []
         while result.has_next():
             rows.append(result.get_next())
+        
+        if not rows:
+            return "Success: Query completed (No Return Rows)."
         return str(rows)
     except Exception as e:
         return f"Kuzu Error: {str(e)}"
+
+@mcp.tool()
+def execute_read_cypher(query: str) -> str:
+    """
+    Executes a raw read-only Cypher query against the Kuzu database.
+    Strictly blocks CREATE, MERGE, SET, and DELETE commands.
+    Available Labels: Project, Task, Resource, Skill.
+    Example: MATCH (p:Project) RETURN p.id, p.name
+    """
+    if any(keyword in query.upper() for keyword in ["CREATE", "MERGE", "SET", "DELETE", "DROP"]):
+        return "Error: This tool is strictly for read-only MATCH queries."
+    
+    return safe_cypher_read(query)
 
 def _recalculate_timeline(project_id: str, repro_set=None):
     """
@@ -504,7 +520,8 @@ def get_allocation_report(project_id: str) -> str:
         events = []
         while assign_nodes.has_next():
             t_name, est, eft, alloc = assign_nodes.get_next()
-            events.append((est, alloc, t_name, "START"))
+            # Priority 0 for START, 1 for END to ensure START is processed first on identical dates
+            events.append((est, 0, alloc, t_name, "START"))
             
             # Defect 2 Fix: Robust drop_date calculation
             drop_date = None
@@ -517,7 +534,7 @@ def get_allocation_report(project_id: str) -> str:
             if not drop_date:
                 drop_date = est # Immediate release fallback
                 
-            events.append((drop_date, -alloc, t_name, "END"))
+            events.append((drop_date, 1, -alloc, t_name, "END"))
         
         events.sort()
         
@@ -526,10 +543,10 @@ def get_allocation_report(project_id: str) -> str:
         conflict_windows = []
         
         for i in range(len(events)):
-            date, delta, task, event_type = events[i]
+            date, priority, delta, task, event_type = events[i]
             current_alloc += delta
             if event_type == "START": active_tasks.add(task)
-            else: active_tasks.remove(task)
+            else: active_tasks.discard(task)
             
             if current_alloc > 100:
                 if i + 1 < len(events):
@@ -577,7 +594,8 @@ def get_portfolio_allocation_report() -> str:
         while assign_nodes.has_next():
             t_name, est, eft, alloc, pid = assign_nodes.get_next()
             label = f"{t_name} ({pid})"
-            events.append((est, alloc, label, "START"))
+            # Priority 0 for START, 1 for END to ensure START is processed first on identical dates
+            events.append((est, 0, alloc, label, "START"))
             
             # Defect 2 Fix: Robust drop_date calculation
             drop_date = None
@@ -590,7 +608,7 @@ def get_portfolio_allocation_report() -> str:
             if not drop_date:
                 drop_date = est # Immediate release fallback
                 
-            events.append((drop_date, -alloc, label, "END"))
+            events.append((drop_date, 1, -alloc, label, "END"))
         
         if not events: continue
         events.sort()
@@ -600,10 +618,10 @@ def get_portfolio_allocation_report() -> str:
         conflict_windows = []
         
         for i in range(len(events)):
-            date, delta, task_label, event_type = events[i]
+            date, priority, delta, task_label, event_type = events[i]
             current_alloc += delta
             if event_type == "START": active_tasks.add(task_label)
-            else: active_tasks.remove(task_label)
+            else: active_tasks.discard(task_label)
             
             if current_alloc > 100:
                 if i + 1 < len(events):
@@ -633,48 +651,53 @@ def _check_over_allocation(resource_name: str) -> str:
     MATCH (r:Resource {name: $name})-[w:WORKS_ON]->(t:Task)
     RETURN t.est_date, t.eft_date, w.allocation
     """
-    res = conn.execute(query, {"name": resource_name})
-    intervals = []
-    while res.has_next():
-        intervals.append(res.get_next())
-        
-    if not intervals:
-        return ""
-        
-    # Sweep-line algorithm
-    events = []
-    for est, eft, alloc in intervals:
-        events.append((est, alloc))
-        # Release happens the next business day after eft
-        # Defect 2 Fix: Robust drop_date calculation (no bare except: pass)
-        drop_date = None
-        if eft:
+    try:
+        res = conn.execute(query, {"name": resource_name})
+        intervals = []
+        while res.has_next():
+            row = res.get_next()
+            if row[0] and row[1]: # Only process if dates are set
+                intervals.append(row)
+            
+        if not intervals:
+            return ""
+            
+        # Sweep-line algorithm
+        events = []
+        for est, eft, alloc in intervals:
+            # We assume duration is working days, so eft is the last working day.
+            # The resource is released on the next business day.
+            # Priority 0 for START, 1 for END to ensure START is processed first on identical dates
+            events.append((est, 0, alloc))
+            
+            # Robust drop_date calculation
+            drop_date = None
             try:
+                # np.busday_offset(eft, 1) gets the next working day
                 drop_date = str(np.busday_offset(eft, 1, roll='following'))
-            except Exception as e:
-                # Log warning to console as requested
-                print(f"Sweep-line Warning: Failed to calculate drop_date for {eft}: {e}")
-        
-        if not drop_date:
-            drop_date = est # Immediate release fallback
+            except Exception:
+                drop_date = est # Immediate release fallback if eft is invalid
             
-        events.append((drop_date, -alloc))
-        
-    # Sort events by date
-    events.sort()
-    
-    current_alloc = 0
-    max_alloc = 0
-    
-    for i in range(len(events)):
-        _, delta = events[i]
-        current_alloc += delta
-        if current_alloc > 100:
-            max_alloc = max(max_alloc, current_alloc)
+            events.append((drop_date, 1, -alloc))
             
-    if max_alloc > 100:
-        return f"[WARNING: Over-allocation] {resource_name} exceeds 100% capacity (Max: {max_alloc}%)."
-    return ""
+        # Sort events by date
+        events.sort()
+        
+        current_alloc = 0
+        max_alloc = 0
+        
+        for i in range(len(events)):
+            _, priority, delta = events[i]
+            current_alloc += delta
+            if current_alloc > 100:
+                max_alloc = max(max_alloc, current_alloc)
+                
+        if max_alloc > 100:
+            return f"[WARNING: Over-allocation] {resource_name} exceeds 100% capacity (Max: {max_alloc}%)."
+        return ""
+    except Exception as e:
+        return f"[ERROR: Query Failed] {str(e)}"
+
 
 @mcp.resource("system://schema")
 def get_schema() -> str:
@@ -767,6 +790,68 @@ def get_project_graph(project_id: str):
         "mimeType": "image/png"
     }
 
+@mcp.resource("project://{project_id}/state/export/pert")
+def get_pert_chart(project_id: str):
+    """Generates a high-fidelity PERT Chart (Precedence Diagram) with CPM metrics."""
+    # 1. Fetch info
+    proj_res = conn.execute("MATCH (p:Project {id: $id}) RETURN p.name", {"id": project_id})
+    if not proj_res.has_next():
+        return "Error: Project not found."
+    project_name = proj_res.get_next()[0]
+    
+    # 2. Fetch Tasks with CPM data
+    task_res = conn.execute("""
+        MATCH (p:Project {id: $id})-[:CONTAINS]->(t:Task)
+        RETURN t.name, t.duration, t.est_date, t.eft_date, t.total_float
+    """, {"id": project_id})
+    
+    dot = graphviz.Digraph(comment=f"PERT: {project_name}")
+    dot.attr(rankdir='LR', splines='ortho')
+    
+    while task_res.has_next():
+        name, dur, es, ef, f = task_res.get_next()
+        # ES/EF are strings YYYY-MM-DD, let's just use MM-DD for brevity in the chart
+        es_short = es[-5:] if es else "N/A"
+        ef_short = ef[-5:] if ef else "N/A"
+        
+        float_color = "red" if (f is not None and f <= 0) else "black"
+        penwidth = "3" if float_color == "red" else "1"
+        
+        # HTML label for structured PERT node
+        label = f'''<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
+            <TR><TD COLSPAN="3"><B>{name}</B></TD></TR>
+            <TR>
+                <TD BGCOLOR="#EEEEEE">{es_short}</TD>
+                <TD>{dur}d</TD>
+                <TD BGCOLOR="#EEEEEE">{ef_short}</TD>
+            </TR>
+            <TR><TD COLSPAN="3" PORT="f">Float: {f if f is not None else '?'}</TD></TR>
+        </TABLE>>'''
+        
+        dot.node(name, label=label, shape='none', color=float_color, penwidth=penwidth)
+        
+    # 3. Dependencies
+    dep_res = conn.execute("""
+        MATCH (p:Project {id: $id})-[:CONTAINS]->(s:Task)-[r:DEPENDS_ON]->(t:Task)
+        RETURN s.name, t.name, s.total_float, t.total_float
+    """, {"id": project_id})
+    
+    while dep_res.has_next():
+        s, t, sf, tf = dep_res.get_next()
+        # Highlight edge if both tasks are on critical path
+        ecolor = "red" if (sf == 0 and tf == 0) else "black"
+        ewith = "2" if ecolor == "red" else "1"
+        dot.edge(s, t, color=ecolor, penwidth=ewith)
+        
+    png_bytes = dot.pipe(format='png')
+    base64_data = base64.b64encode(png_bytes).decode('utf-8')
+    
+    return {
+        "type": "image",
+        "data": base64_data,
+        "mimeType": "image/png"
+    }
+
 @mcp.tool()
 def create_project(project_id: str, start_date: str, name: str) -> str:
     """
@@ -779,9 +864,11 @@ def create_project(project_id: str, start_date: str, name: str) -> str:
     query = """
     MERGE (p:Project {id: $id})
     SET p.start_date = $start_date, p.name = $name
+    RETURN p.id
     """
     params = {"id": project_id, "start_date": start_date, "name": name}
-    return safe_cypher_read(query, params)
+    res = safe_cypher_read(query, params)
+    return f"Project created/updated: {res}"
 
 @mcp.tool()
 def add_task(project_id: str, name: str, duration: int, cost: float, description: str = "", optimistic: int = None, pessimistic: int = None) -> str:
@@ -1231,7 +1318,8 @@ def auto_level_schedule(project_id: str) -> str:
             # Sweep-line to find first conflict date
             events = []
             for t_name, est, eft, alloc, status, t_float, t_pid in tasks_data:
-                events.append((est, alloc, t_name, "START", status, t_float, t_pid))
+                # Priority 0 for START, 1 for END
+                events.append((est, 0, alloc, t_name, "START", status, t_float, t_pid))
                 # M1 Fix: Guard against None eft (same fix as other allocation functions)
                 drop_date = None
                 if eft:
@@ -1241,14 +1329,14 @@ def auto_level_schedule(project_id: str) -> str:
                         pass
                 if not drop_date:
                     drop_date = est  # Immediate release fallback
-                events.append((drop_date, -alloc, t_name, "END", status, t_float, t_pid))
+                events.append((drop_date, 1, -alloc, t_name, "END", status, t_float, t_pid))
             
             events.sort()
             current_alloc = 0
             active_tasks = {} # name -> {status, float, pid}
             
             for i in range(len(events)):
-                date, delta, t_name, ev_type, status, t_float, t_pid = events[i]
+                date, priority, delta, t_name, ev_type, status, t_float, t_pid = events[i]
                 current_alloc += delta
                 if ev_type == "START": active_tasks[t_name] = {"status": status, "float": t_float, "pid": t_pid}
                 else: active_tasks.pop(t_name, None)
@@ -1359,16 +1447,129 @@ def ping() -> str:
     """Health check tool to verify the MCP server is running and responsive."""
     return "pong: ProjectLogicEngine is online."
 
+# ─── Phase 11: Entity Inspection Tools ────────────────────────────────────────
+
+@mcp.tool()
+def list_projects() -> str:
+    """
+    Lists all projects in the system as a Markdown table.
+    Returns: | Project ID | Name | Start Date |
+    """
+    query = "MATCH (p:Project) RETURN p.id, p.name, p.start_date ORDER BY p.start_date"
+    rows = []
+    try:
+        res = conn.execute(query)
+        while res.has_next():
+            rows.append(res.get_next())
+    except Exception as e:
+        return f"Kuzu Error: {e}"
+
+    if not rows:
+        return "No projects found."
+
+    table = "| Project ID | Name | Start Date |\n|---|---|---|\n"
+    for pid, name, start in rows:
+        table += f"| {pid or '—'} | {name or '—'} | {start or '—'} |\n"
+    return table
+
+
+@mcp.tool()
+def list_tasks(project_id: str = None) -> str:
+    """
+    Lists tasks as a Markdown table. If project_id is supplied, filters to that project only.
+    Returns: | Task Name | Duration | Status | Start Date | End Date |
+    """
+    if project_id:
+        query = """
+        MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
+        RETURN t.name, t.duration, t.status, t.est_date, t.eft_date
+        ORDER BY t.est_date
+        """
+        params = {"pid": project_id}
+    else:
+        query = """
+        MATCH (t:Task)
+        RETURN t.name, t.duration, t.status, t.est_date, t.eft_date
+        ORDER BY t.est_date
+        """
+        params = {}
+
+    rows = []
+    try:
+        res = conn.execute(query, params) if params else conn.execute(query)
+        while res.has_next():
+            rows.append(res.get_next())
+    except Exception as e:
+        return f"Kuzu Error: {e}"
+
+    if not rows:
+        return "No tasks found."
+
+    table = "| Task Name | Duration (d) | Status | Start Date | End Date |\n|---|---|---|---|---|\n"
+    for name, dur, status, es, ef in rows:
+        table += f"| {name or '—'} | {dur or 0} | {status or '—'} | {es or '—'} | {ef or '—'} |\n"
+    return table
+
+
+@mcp.tool()
+def list_resources() -> str:
+    """
+    Lists all registered resources (HUMAN and EQUIPMENT) as a Markdown table.
+    Returns: | Resource Name | Type | Cost Rate |
+    """
+    query = "MATCH (r:Resource) RETURN r.name, r.type, r.cost_rate ORDER BY r.type, r.name"
+    rows = []
+    try:
+        res = conn.execute(query)
+        while res.has_next():
+            rows.append(res.get_next())
+    except Exception as e:
+        return f"Kuzu Error: {e}"
+
+    if not rows:
+        return "No resources found."
+
+    table = "| Resource Name | Type | Cost Rate |\n|---|---|---|\n"
+    for name, rtype, rate in rows:
+        rate_str = f"${rate:,.2f}/day" if rate is not None else "—"
+        table += f"| {name or '—'} | {rtype or '—'} | {rate_str} |\n"
+    return table
+
+
+@mcp.tool()
+def list_skills() -> str:
+    """
+    Lists all registered skills in the competency database as a Markdown table.
+    Returns: | Skill Name | Description |
+    """
+    query = "MATCH (s:Skill) RETURN s.name, s.description ORDER BY s.name"
+    rows = []
+    try:
+        res = conn.execute(query)
+        while res.has_next():
+            rows.append(res.get_next())
+    except Exception as e:
+        return f"Kuzu Error: {e}"
+
+    if not rows:
+        return "No skills found."
+
+    table = "| Skill Name | Description |\n|---|---|\n"
+    for name, desc in rows:
+        table += f"| {name or '—'} | {desc or '—'} |\n"
+    return table
+
+
 @mcp.resource("system://info")
 def get_system_info() -> str:
     """Returns basic server status."""
-    return "Engine Status: Awaiting Phase 1 Database Initialization."
+    return "Engine Status: Online | Phase 11 (Audit & Inspection) | Logic Engine Active"
 
 @mcp.resource("system://constitution")
 def get_constitution() -> str:
     """Returns the Symbolic Standard and Laws of Logic for the Project Engine."""
     constitution = """
-# mcp-project-logic Constitution (Phase 4 Extended)
+# mcp-project-logic Constitution (Phase 11)
 
 ## 1. The Symbolic Standard
 - SKILL Nodes: 🔨
@@ -1383,6 +1584,7 @@ def get_constitution() -> str:
 - Law II: The Law of Temporal Sequence (Working day calendar)
 - Law III: The Law of Financial Tracking (Cost summation)
 - Law IV: The Law of Optimization (AI may shift AI_DRAFT tasks within their Total Float to resolve conflicts)
+- Law V: The Law of Transparency (All system entities must be inspectable via dedicated listing tools)
 
 ## 3. State Monitors
 - Resource Integrity: Verify resource existence and skill possession.

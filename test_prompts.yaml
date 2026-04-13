@@ -1,0 +1,63 @@
+scenarios:
+  - name: "01. Basic Project Setup"
+    prompt: "Create a new project called 'BetaRelease' starting on 2026-05-01. Add three tasks: 'Design' (duration: 4, cost: 2000), 'Dev' (duration: 10, cost: 5000), and 'Test' (duration: 5, cost: 1500)."
+
+  - name: "02. Dependency Chain & Timeline"
+    prompt: "For the 'BetaRelease' project, create dependencies so that 'Design' goes first, followed by 'Dev', followed by 'Test'. Then run a timeline check to see their calculated est_date and eft_date."
+
+  - name: "03. Temporal Weekend Math"
+    prompt: "Create a new project 'WeekendSync' starting on 2026-05-01 (a Friday). Add a task 'DataMigration' with a duration of 5 days. Check the timeline and tell me the completion date, verifying that Saturday and Sunday were skipped."
+
+  - name: "04. Law I: Circular Dependency Block"
+    prompt: "Create a project 'Paradox'. Add tasks 'A', 'B', and 'C'. Create dependencies: A -> B and B -> C. Finally, attempt to create a dependency C -> A. It should block you. Let me know what error occurs."
+
+  - name: "05. Resource Registration"
+    prompt: "Create three new resources: 'Alice' (HUMAN, cost_rate 500), 'Bob' (HUMAN, cost_rate 450), and 'BuildServer' (EQUIPMENT, cost_rate 50). Give them short descriptions."
+
+  - name: "06. Task Assignment Validation"
+    prompt: "In the 'BetaRelease' project, assign 'Alice' to the 'Design' task at 100% allocation. Assign 'Bob' to 'Dev' at 100%, and 'BuildServer' to 'Test'."
+
+  - name: "07. Skill Matrix Enforcement"
+    prompt: "Add a skill called 'Python' and require it for the 'Dev' task. If 'Bob' is assigned to 'Dev' without the skill, you should get a warning. Grant 'Bob' the 'Python' skill to fix the warning."
+
+  - name: "08. Resource Over-allocation Detection"
+    prompt: "Create a new project called 'Overload'. Add tasks 'Task_X' (duration: 5) and 'Task_Y' (duration: 5) running in parallel. Assign 'Alice' to both at 100%. Fetch the allocation report, which should flag a 200% allocation."
+
+  - name: "09. Automated Resource Leveling"
+    prompt: "Following up on the 'Overload' project where Alice is double-booked: Use the auto_level_schedule tool to mathematically shift one of the tasks. Check the timeline again to see the new dates."
+
+  - name: "10. Critical Path Extraction"
+    prompt: "For the 'BetaRelease' project, get the critical path. Tell me which sequence of tasks is driving the ultimate deadline of the project."
+
+  - name: "11. PERT & Risk Analysis"
+    prompt: "In the 'BetaRelease' project, assign an optimistic duration of 8 and a pessimistic of 16 to the 'Dev' task. Run the PERT analysis, then fetch the Risk Report and tell me the new Expected Duration."
+
+  - name: "12. Baselines & Snapshots"
+    prompt: "Baseline the 'BetaRelease' project. Then, modify the 'Design' task to have a duration of 6. Notice how the baseline dates remain the same while the current dates shift."
+
+  - name: "13. Progress Reporting"
+    prompt: "In the 'BetaRelease' project, specify that the 'Design' task is now 50% complete by updating its progress."
+
+  - name: "14. Financial Actuals Tracking"
+    prompt: "The 'Design' task in the 'BetaRelease' project was planned for 2000 in fixed costs plus resource costs. Log an actual_cost of 3500 for it."
+
+  - name: "15. Earned Value Management (EVM)"
+    prompt: "Fetch the EVM report for the 'BetaRelease' project. Read the Planned Value (PV), Earned Value (EV), and Actual Cost (AC). Give me the Cost Performance Index (CPI)."
+
+  - name: "16. Draft & Lock Constraints"
+    prompt: "Create a project 'LockedIn'. Add Task1 and Task2, and make Task1 depend on Task2 (Task2 -> Task1). Lock Task1. Then artificially extend the duration of Task2. Check the timeline and report the calendar conflict that arises."
+
+  - name: "17. Sandboxing & What-If Cloning"
+    prompt: "Clone the 'BetaRelease' project into a semantic scenario called 'Scenario_FastTrack'. In the clone, change the 'Design' task duration to 2. Verify that the original 'BetaRelease' project's 'Design' task still has its old duration."
+
+  - name: "18. Kanban JSON Generation"
+    prompt: "Use the export_to_kanban tool on the 'BetaRelease' project. Output the raw JSON so I can see the formatted Jira/Trello cards."
+
+  - name: "19. Enterprise Webhook Generation"
+    prompt: "Generate a briefing webhook for the 'BetaRelease' project. Give me the exact Markdown string that would be sent to Slack/Teams."
+
+  - name: "20. Agent Sub-Prompt Derivation"
+    prompt: "For the 'Dev' task in the 'BetaRelease' project, generate the agent sub-prompt to determine what specifically needs to be done by an autonomous worker."
+
+  - name: "21. High-Fidelity PERT Visualization"
+    prompt: "Generate the PERT Chart image for the 'BetaRelease' project using resource project://BetaRelease/state/export/pert. Verify that the critical path is highlighted in red and contains dates."
