@@ -61,3 +61,9 @@ scenarios:
 
   - name: "21. High-Fidelity PERT Visualization"
     prompt: "Generate the PERT Chart image for the 'BetaRelease' project using resource project://BetaRelease/state/export/pert. Verify that the critical path is highlighted in red and contains dates."
+
+  - name: "22. The Elephant Banquet (Chunked)"
+    steps:
+      - "Step 1: Create a project with ID 'daizy_llama' starting on 2026-05-01."
+      - "Step 2: Add a skill named 'Logistical Butchery' and a resource named 'Dr_Frankenstein'."
+      - "Step 3: Assign Dr_Frankenstein to a new task 'T1_Blueprint' (duration 5, cost 300)."

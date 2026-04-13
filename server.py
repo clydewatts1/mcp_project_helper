@@ -83,7 +83,10 @@ def safe_cypher_read(query: str, params: dict = None) -> str:
             return "Success: Query completed (No Return Rows)."
         return str(rows)
     except Exception as e:
-        return f"Kuzu Error: {str(e)}"
+        error_msg = str(e)
+        if len(error_msg) > 200:
+            error_msg = error_msg[:200] + "... [TRUNCATED]"
+        return f"Database Error: {error_msg}. Please check your tool arguments and try again."
 
 @mcp.tool()
 def execute_read_cypher(query: str) -> str:
@@ -883,10 +886,16 @@ def create_project(project_id: str, start_date: str, name: str) -> str:
     return f"Project created/updated: {res}"
 
 @mcp.tool()
-def add_task(project_id: str, name: str, duration: int, cost: float, description: str = "", optimistic: int = None, pessimistic: int = None) -> str:
+def add_task(project_id: str, name: str, duration, cost, description: str = "", optimistic: int = None, pessimistic: int = None) -> str:
     """
     Adds a task to a project and initializes its dates and PERT estimates.
     """
+    try:
+        duration = int(duration)
+        cost = float(cost)
+    except ValueError:
+        return "Error: duration must be an integer and cost must be a number."
+
     # Default PERT estimates to the provided duration if not specified
     opt = optimistic if optimistic is not None else duration
     pess = pessimistic if pessimistic is not None else duration
@@ -926,19 +935,40 @@ def add_task(project_id: str, name: str, duration: int, cost: float, description
     return res
 
 @mcp.tool()
-def create_dependency(source_name: str, target_name: str, lag: int = 0) -> str:
+def create_dependency(source_name: str, target_name: str = None, target_names: list = None, lag: int = 0) -> str:
     """
-    Creates a dependency between two tasks (Source -> Target).
-    Enforces Law I: No Circular Dependencies.
+    Creates a dependency between two tasks. 
+    CRITICAL: You MUST ensure BOTH tasks exist before calling this.
+    source_name: The task that must finish first.
+    target_name: The task that waits for the source to finish.
+    lag: Wait time in working days. Use 0 by default.
     """
-    # Gate 1: Cycle Check (Extract exact count natively, avoid brittle string matching)
+    # Fan-out: handle list form defensively
+    if target_name is None and target_names:
+        results = []
+        for t in target_names:
+            results.append(create_dependency(source_name=source_name, target_name=t, lag=lag))
+        return "\n".join(results)
+    if target_name is None:
+        return "Error: target_name is required."
+
+    # Validate node existence
+    s_exists = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": source_name}).get_next()[0]
+    if s_exists == 0:
+        return f"Error: Source task '{source_name}' not found. Call 'add_task' to create it."
+        
+    t_exists = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": target_name}).get_next()[0]
+    if t_exists == 0:
+        return f"Error: Target task '{target_name}' not found. Call 'add_task' to create it."
+
+    # Gate 1: Cycle Check
     check_query = "MATCH path=(t:Task {name: $target_name})-[*]->(s:Task {name: $source_name}) RETURN count(path)"
     try:
         check_res = conn.execute(check_query, {"source_name": source_name, "target_name": target_name})
         if check_res.has_next():
             path_count = check_res.get_next()[0]
             if path_count > 0:
-                return "Law I Violation: Circular Dependency Detected."
+                return "Law I Violation: Circular Dependency. Linking these creates a cycle. Do NOT attempt to create this specific dependency again. Re-evaluate your plan."
     except Exception as e:
          return f"Kuzu Error during Cycle Check: {str(e)}"
 
@@ -950,7 +980,7 @@ def create_dependency(source_name: str, target_name: str, lag: int = 0) -> str:
     """
     res = safe_cypher_read(query, {"source_name": source_name, "target_name": target_name, "lag": lag})
       
-    # Trigger recalculation: Correctly fetch the project_id using the source_name
+    # Trigger recalculation
     proj_query = "MATCH (p:Project)-[:CONTAINS]->(t:Task {name: $name}) RETURN p.id"
     proj_res = conn.execute(proj_query, {"name": source_name})
     if proj_res.has_next():
@@ -1213,6 +1243,14 @@ def grant_skill(resource_name: str, skill_name: str, proficiency: str = "Interme
     """
     Grants a skill to a resource.
     """
+    s_exists = conn.execute("MATCH (s:Skill {name: $name}) RETURN count(*)", {"name": skill_name}).get_next()[0]
+    if s_exists == 0:
+        return f"Error: Skill '{skill_name}' does not exist. Call 'add_skill' to register this capability first."
+        
+    r_exists = conn.execute("MATCH (r:Resource {name: $name}) RETURN count(*)", {"name": resource_name}).get_next()[0]
+    if r_exists == 0:
+        return f"Error: Resource '{resource_name}' does not exist. Call 'add_resource' to register."
+
     query = """
     MATCH (r:Resource {name: $resource_name}), (s:Skill {name: $skill_name})
     MERGE (r)-[h:HAS_SKILL {proficiency: $proficiency}]->(s)
@@ -1226,6 +1264,14 @@ def require_skill(task_name: str, skill_name: str) -> str:
     """
     Requires a skill for a specific task.
     """
+    s_exists = conn.execute("MATCH (s:Skill {name: $name}) RETURN count(*)", {"name": skill_name}).get_next()[0]
+    if s_exists == 0:
+        return f"Error: Skill '{skill_name}' does not exist. Call 'add_skill' to register this capability first."
+        
+    t_exists = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": task_name}).get_next()[0]
+    if t_exists == 0:
+        return f"Error: Task '{task_name}' does not exist. Call 'add_task' to register."
+
     query = """
     MATCH (t:Task {name: $task_name}), (s:Skill {name: $skill_name})
     MERGE (t)-[r:REQUIRES_SKILL]->(s)
@@ -1235,23 +1281,41 @@ def require_skill(task_name: str, skill_name: str) -> str:
     return safe_cypher_read(query, params)
 
 @mcp.tool()
-def assign_resource(resource_name: str, task_name: str, allocation: int) -> str:
+def assign_resource(resource_name: str, task_name: str = None, task_names: list = None, allocation: int = 100) -> str:
     """
     Assigns a resource to a task with a specified allocation percentage.
     Checks for skill mismatches and over-allocation.
+    If multiple tasks are passed via task_names (list), each is processed in sequence.
     """
+    # Defensive coercion for allocation (handle cases where LLM passes "100")
+    try:
+        if isinstance(allocation, str):
+            allocation = allocation.replace("%", "")
+        allocation = int(allocation)
+    except ValueError:
+        return "Error: allocation must be a whole number between 1 and 100."
+
+    # Fan-out: handle list form defensively
+    if task_name is None and task_names:
+        results = []
+        for t in task_names:
+            results.append(assign_resource(resource_name=resource_name, task_name=t, allocation=allocation))
+        return "\n".join(results)
+    if task_name is None:
+        return "Error: task_name is required."
+
     # 1. Gate 1: Strict existence check
     res_node = conn.execute("MATCH (r:Resource {name: $name}) RETURN count(*)", {"name": resource_name})
-    res_exists = res_node.get_next()[0] # count(*) returns a row with one int
+    res_exists = res_node.get_next()[0] 
     
     task_node = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": task_name})
     task_exists = task_node.get_next()[0]
     
     if res_exists == 0:
-        raise ValueError(f"Resource '{resource_name}' does not exist.")
+        return f"Error: Resource '{resource_name}' does not exist in the database. You MUST call the 'add_resource' tool to create it before attempting this assignment again."
     if task_exists == 0:
-        raise ValueError(f"Task '{task_name}' does not exist.")
-        
+        return f"Error: Task '{task_name}' does not exist. Call 'add_task' first."
+
     # 2. Execute Assignment
     assign_query = """
     MATCH (r:Resource {name: $r}), (t:Task {name: $t})
@@ -1261,6 +1325,7 @@ def assign_resource(resource_name: str, task_name: str, allocation: int) -> str:
     """
     safe_cypher_read(assign_query, {"r": resource_name, "t": task_name, "allocation": allocation})
     
+    msg = f"Resource '{resource_name}' assigned to '{task_name}' at {allocation}%."
     warnings = []
     
     # 3. State Monitor A: Skill Check
@@ -1288,7 +1353,6 @@ def assign_resource(resource_name: str, task_name: str, allocation: int) -> str:
         warnings.append(over_alloc_msg)
         
     # 5. Return
-    msg = f"Resource '{resource_name}' successfully assigned to '{task_name}' at {allocation}% allocation."
     if warnings:
         msg += "\n" + "\n".join(warnings)
     return msg
@@ -1304,8 +1368,8 @@ def check_timeline(project_id: str) -> str:
 @mcp.tool()
 def auto_level_schedule(project_id: str) -> str:
     """
-    Automatic Resource Leveler: Resolves resource over-allocations by shifting 
-    tasks with positive float. Adheres to Law of Optimization.
+    Fixes resource over-allocations automatically.
+    Call this IMMEDIATELY if an assign_resource tool returns an "[WARNING: Over-allocation]" message.
     """
     shifts = []
     max_iterations = 20 # Prevent infinite loops

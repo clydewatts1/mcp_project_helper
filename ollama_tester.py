@@ -23,7 +23,12 @@ from mcp.client.session import ClientSession
 VENV_PYTHON = sys.executable
 SERVER_PARAMS = StdioServerParameters(command=VENV_PYTHON, args=["server.py"])
 
-SYSTEM_PROMPT = """You are a Rigid Project Logic Engine controller.
+SYSTEM_PROMPT = """You are an expert Project Management AI connected to a strict Kuzu Graph Database.
+You MUST use the provided tools to interact with the database.
+Do NOT guess or hallucinate tools. If a tool returns an error, READ the error and use the suggested next tool.
+Execute tasks step-by-step. Never repeat the exact same failed tool call.
+
+You are a Rigid Project Logic Engine controller.
 Rules:
 1. Every Project must have a unique identifier (project_id). Derive a short uppercase ID from the name if not supplied (e.g. 'BETA_1').
 2. Durations and lags are Working Days (weekends excluded automatically).
@@ -32,6 +37,8 @@ Rules:
 5. Kuzu Cypher: NEVER use CALL procedures. Query nodes directly, e.g. MATCH (p:Project) RETURN p.id, p.name
 6. CRITICAL — Numeric arguments: ALWAYS strip currency symbols and units before passing to tools. '$100/day' must be passed as 100.0. '$1,500' must be 1500.0. Never pass strings where a number is required.
 7. CRITICAL — Resource names with underscores: pass the name exactly as written (e.g. 'Sir_Chews_A_Lot'), do NOT replace underscores with spaces.
+8. CRITICAL — create_dependency only links ONE source to ONE target per call. If 'Task A depends on B AND C', make TWO calls: create_dependency('A','B') then create_dependency('A','C'). NEVER pass a list to target_name.
+9. CRITICAL — assign_resource only links ONE resource to ONE task per call. If 'Assign Bob to X, Y, and Z', make THREE calls. NEVER pass a list to task_name. Allocation must be a plain integer (e.g. 100).
 """
 
 CANNED_QUERIES = {
@@ -132,7 +139,16 @@ async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: l
                 for t in tools_resp.tools
             ]
 
+            MAX_ITERATIONS = 10
+            iteration_count = 0
+            valid_tool_names = [t.name for t in tools_resp.tools]
+
             while True:
+                if iteration_count >= MAX_ITERATIONS:
+                    output_queue.append(("assistant", "🛑 Circuit Breaker Triggered: LLM exceeded maximum consecutive tool calls (Looping).", None))
+                    messages.append({"role": "assistant", "content": "I encountered an infinite loop error and had to stop."})
+                    break
+
                 response = ollama.chat(
                     model="llama3.2", messages=messages, tools=tools
                 )
@@ -147,6 +163,13 @@ async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: l
                         fn = call.get("function", {})
                         t_name = fn.get("name")
                         t_args = fn.get("arguments", {})
+                        
+                        if t_name not in valid_tool_names:
+                            fake_result = f"CRITICAL ERROR: Tool '{t_name}' does not exist. Available tools are: {', '.join(valid_tool_names)}."
+                            output_queue.append(("tool_result", fake_result, t_name))
+                            messages.append({"role": "tool", "name": t_name, "content": fake_result})
+                            continue
+                            
                         output_queue.append(("tool_call", json.dumps(t_args), t_name))
                         try:
                             result = await session.call_tool(t_name, arguments=t_args)
@@ -162,6 +185,8 @@ async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: l
                         )
                 else:
                     break  # Final natural-language answer reached
+                
+                iteration_count += 1
 
     return messages
 
@@ -256,20 +281,29 @@ def main():
                 chosen = next((s for s in scenarios if s["name"] == sel), None)
                 if chosen:
                     st.session_state.messages = [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": chosen["prompt"]},
+                        {"role": "system", "content": SYSTEM_PROMPT}
                     ]
-                    st.session_state.run_triggered = True
-
+                    
+                    scenario_steps = chosen.get('steps', [chosen.get('prompt')])
+                    
+                    for step_idx, step_text in enumerate(scenario_steps):
+                        st.markdown(f"### Executing Step {step_idx + 1} of {len(scenario_steps)}")
+                        
+                        st.session_state.messages.append({"role": "user", "content": step_text})
+                        st.chat_message("user").write(step_text)
+                        
+                        run_llm_loop(SYSTEM_PROMPT)
+                        
+        st.markdown("---")
+        st.subheader("Scenario History")
         for msg in st.session_state.messages:
             if msg["role"] == "user":
                 st.chat_message("user").write(msg["content"])
             elif msg["role"] == "assistant" and msg.get("content"):
                 st.chat_message("assistant").write(msg["content"])
-
-        if st.session_state.run_triggered:
-            st.session_state.run_triggered = False
-            run_llm_loop(SYSTEM_PROMPT)
+            elif msg["role"] == "tool":
+                with st.expander(f"🛠️ Tool: {msg.get('name', '?')}"):
+                    st.write(msg["content"])
 
     # ── Interactive Chat ─────────────────────────────────────
     elif view == "💬 Interactive Chat":
