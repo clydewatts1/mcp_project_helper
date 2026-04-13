@@ -764,10 +764,14 @@ def get_project_graph(project_id: str):
     dot.attr(rankdir='LR')
     dot.attr('node', shape='box', style='rounded,filled', fillcolor='lightblue', fontname='Helvetica')
     
+    node_ids = {}
+    
     while task_res.has_next():
         name, dur, cost = task_res.get_next()
+        node_id = f"node_{len(node_ids)}"
+        node_ids[name] = node_id
         label = f"{name}\n({dur}d | ${cost:,.0f})"
-        dot.node(name, label)
+        dot.node(node_id, label)
         
     # 3. Fetch all dependencies
     dep_res = conn.execute("""
@@ -777,8 +781,9 @@ def get_project_graph(project_id: str):
     
     while dep_res.has_next():
         s, t, lag = dep_res.get_next()
-        label = f"lag={lag}" if lag > 0 else ""
-        dot.edge(s, t, label=label)
+        if s in node_ids and t in node_ids:
+            label = f"lag={lag}" if lag > 0 else ""
+            dot.edge(node_ids[s], node_ids[t], label=label)
         
     # 4. Generate PNG bytes
     png_bytes = dot.pipe(format='png')
@@ -808,8 +813,13 @@ def get_pert_chart(project_id: str):
     dot = graphviz.Digraph(comment=f"PERT: {project_name}")
     dot.attr(rankdir='LR', splines='ortho')
     
+    node_ids = {}
+    import html
+    
     while task_res.has_next():
         name, dur, es, ef, f = task_res.get_next()
+        node_id = f"node_{len(node_ids)}"
+        node_ids[name] = node_id
         # ES/EF are strings YYYY-MM-DD, let's just use MM-DD for brevity in the chart
         es_short = es[-5:] if es else "N/A"
         ef_short = ef[-5:] if ef else "N/A"
@@ -818,8 +828,9 @@ def get_pert_chart(project_id: str):
         penwidth = "3" if float_color == "red" else "1"
         
         # HTML label for structured PERT node
+        safe_name = html.escape(name)
         label = f'''<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">
-            <TR><TD COLSPAN="3"><B>{name}</B></TD></TR>
+            <TR><TD COLSPAN="3"><B>{safe_name}</B></TD></TR>
             <TR>
                 <TD BGCOLOR="#EEEEEE">{es_short}</TD>
                 <TD>{dur}d</TD>
@@ -828,7 +839,7 @@ def get_pert_chart(project_id: str):
             <TR><TD COLSPAN="3" PORT="f">Float: {f if f is not None else '?'}</TD></TR>
         </TABLE>>'''
         
-        dot.node(name, label=label, shape='none', color=float_color, penwidth=penwidth)
+        dot.node(node_id, label=label, shape='none', color=float_color, penwidth=penwidth)
         
     # 3. Dependencies
     dep_res = conn.execute("""
@@ -838,10 +849,11 @@ def get_pert_chart(project_id: str):
     
     while dep_res.has_next():
         s, t, sf, tf = dep_res.get_next()
-        # Highlight edge if both tasks are on critical path
-        ecolor = "red" if (sf == 0 and tf == 0) else "black"
-        ewith = "2" if ecolor == "red" else "1"
-        dot.edge(s, t, color=ecolor, penwidth=ewith)
+        if s in node_ids and t in node_ids:
+            # Highlight edge if both tasks are on critical path
+            ecolor = "red" if (sf == 0 and tf == 0) else "black"
+            ewith = "2" if ecolor == "red" else "1"
+            dot.edge(node_ids[s], node_ids[t], color=ecolor, penwidth=ewith)
         
     png_bytes = dot.pipe(format='png')
     base64_data = base64.b64encode(png_bytes).decode('utf-8')
@@ -1557,6 +1569,100 @@ def list_skills() -> str:
     table = "| Skill Name | Description |\n|---|---|\n"
     for name, desc in rows:
         table += f"| {name or '—'} | {desc or '—'} |\n"
+    return table
+
+
+# ─── Phase 12: Dependency Impact & Traceability ───────────────────────────────
+
+@mcp.tool()
+def get_task_children(task_name: str, depth: int = 1, include_resources: bool = False) -> str:
+    """
+    Returns a list of downstream dependent tasks (children) up to a specified depth.
+    Depth 1 = direct children. Depth 2 = children and grandchildren.
+    """
+    depth = max(1, min(depth, 10)) # Bound between 1 and 10
+    
+    if include_resources:
+        query = f"""
+        MATCH (t:Task {{name: $name}})-[e:DEPENDS_ON*1..{depth}]->(child:Task)
+        OPTIONAL MATCH (child)<-[:WORKS_ON]-(r:Resource)
+        RETURN child.name, min(length(e)) AS depth, child.duration, child.est_date, child.eft_date, child.status, collect(r.name) AS resources
+        ORDER BY depth, child.est_date
+        """
+    else:
+        query = f"""
+        MATCH (t:Task {{name: $name}})-[e:DEPENDS_ON*1..{depth}]->(child:Task)
+        RETURN child.name, min(length(e)) AS depth, child.duration, child.est_date, child.eft_date, child.status
+        ORDER BY depth, child.est_date
+        """
+        
+    res = conn.execute(query, {"name": task_name})
+    
+    if include_resources:
+        table = "| Child Task | Depth | Duration | Start Date | End Date | Status | Assigned Resources |\n"
+        table += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    else:
+        table = "| Child Task | Depth | Duration | Start Date | End Date | Status |\n"
+        table += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        
+    count = 0
+    while res.has_next():
+        row = res.get_next()
+        if include_resources:
+            resources = ", ".join([r for r in row[6] if r]) if row[6] else "None"
+            table += f"| {row[0]} | {row[1]} | {row[2]}d | {row[3]} | {row[4]} | {row[5]} | {resources} |\n"
+        else:
+            table += f"| {row[0]} | {row[1]} | {row[2]}d | {row[3]} | {row[4]} | {row[5]} |\n"
+        count += 1
+        
+    if count == 0:
+        return f"No downstream children found for '{task_name}' within depth {depth}."
+    return table
+
+
+@mcp.tool()
+def get_task_parents(task_name: str, depth: int = 1, include_resources: bool = False) -> str:
+    """
+    Returns a list of upstream tasks (parents/prerequisites) up to a specified depth.
+    Depth 1 = direct parents. Depth 2 = parents and grandparents.
+    """
+    depth = max(1, min(depth, 10)) # Bound between 1 and 10
+    
+    if include_resources:
+        query = f"""
+        MATCH (parent:Task)-[e:DEPENDS_ON*1..{depth}]->(t:Task {{name: $name}})
+        OPTIONAL MATCH (parent)<-[:WORKS_ON]-(r:Resource)
+        RETURN parent.name, min(length(e)) AS depth, parent.duration, parent.est_date, parent.eft_date, parent.status, collect(r.name) AS resources
+        ORDER BY depth, parent.eft_date
+        """
+    else:
+        query = f"""
+        MATCH (parent:Task)-[e:DEPENDS_ON*1..{depth}]->(t:Task {{name: $name}})
+        RETURN parent.name, min(length(e)) AS depth, parent.duration, parent.est_date, parent.eft_date, parent.status
+        ORDER BY depth, parent.eft_date
+        """
+        
+    res = conn.execute(query, {"name": task_name})
+    
+    if include_resources:
+        table = "| Parent Task | Depth | Duration | Start Date | End Date | Status | Assigned Resources |\n"
+        table += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    else:
+        table = "| Parent Task | Depth | Duration | Start Date | End Date | Status |\n"
+        table += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        
+    count = 0
+    while res.has_next():
+        row = res.get_next()
+        if include_resources:
+            resources = ", ".join([r for r in row[6] if r]) if row[6] else "None"
+            table += f"| {row[0]} | {row[1]} | {row[2]}d | {row[3]} | {row[4]} | {row[5]} | {resources} |\n"
+        else:
+            table += f"| {row[0]} | {row[1]} | {row[2]}d | {row[3]} | {row[4]} | {row[5]} |\n"
+        count += 1
+        
+    if count == 0:
+        return f"No upstream parents found for '{task_name}' within depth {depth}."
     return table
 
 

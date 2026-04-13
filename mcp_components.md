@@ -57,6 +57,12 @@ This document provides a functional description of every `@mcp.tool()` and `@mcp
 | `list_skills` | `()` | Returns all skills as a Markdown table. |
 | `execute_read_cypher` | `(query)` | Executes raw read-only MATCH queries. Blocks mutations. |
 
+### Dependency Traceability (Phase 12)
+| Tool | Signature | Purpose |
+|---|---|---|
+| `get_task_children` | `(task_name, depth=1, include_resources=False)` | Traverses downstream `DEPENDS_ON` relationships. |
+| `get_task_parents` | `(task_name, depth=1, include_resources=False)` | Traverses upstream `DEPENDS_ON` relationships. |
+
 ---
 
 ## Resources (Read-Only Context URIs)

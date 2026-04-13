@@ -41,7 +41,7 @@ CANNED_QUERIES = {
         "t.est_date AS EarlyStart, t.eft_date AS EarlyFinish, t.total_float AS Float"
     ),
     "List all Resources": "MATCH (r:Resource) RETURN r.name AS Name, r.type AS Type, r.cost_rate AS CostRate",
-    "List all Skills": "MATCH (s:Skill) RETURN s.name AS Name, s.description AS Desc",
+    "List all Skills": "MATCH (s:Skill) RETURN s.name AS Name, s.description AS Description",
     "Resource Assignments": (
         "MATCH (r:Resource)-[w:WORKS_ON]->(t:Task) "
         "RETURN r.name AS Resource, t.name AS Task, w.allocation AS Allocation"
@@ -88,6 +88,8 @@ async def _call_tool(tool_name: str, tool_args: dict) -> str:
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments=tool_args)
+            if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
+                return result.content[0].text
             return str(result)
 
 
@@ -146,7 +148,10 @@ async def _llm_loop_async(messages: list, formatted_tools: list, output_queue: l
                         output_queue.append(("tool_call", json.dumps(t_args), t_name))
                         try:
                             result = await session.call_tool(t_name, arguments=t_args)
-                            result_str = str(result)
+                            if result.content and len(result.content) > 0 and hasattr(result.content[0], "text"):
+                                result_str = result.content[0].text
+                            else:
+                                result_str = str(result)
                         except Exception as e:
                             result_str = f"Tool Error: {e}"
                         output_queue.append(("tool_result", result_str, t_name))

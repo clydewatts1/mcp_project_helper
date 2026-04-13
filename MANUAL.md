@@ -58,6 +58,11 @@ These tools allow the LLM to mutate the database, calculate math, and orchestrat
 * list_skills(): Lists all skills in the competency database (| Skill Name | Description |).
 * execute_read_cypher(query): Executes a raw read-only Cypher query against the Kùzu database. Strictly blocks mutations (CREATE/DELETE/SET).
 
+### **7. Dependency Traceability (Phase 12)**
+
+* get_task_children(task_name, depth=1, include_resources=False): Returns a list of downstream dependent tasks. Optionally includes assigned resources.
+* get_task_parents(task_name, depth=1, include_resources=False): Returns a list of upstream tasks (prerequisites). Optionally includes assigned resources.
+
 
 ## **📊 MCP Resource Reference (Context & Read-Only Data)**
 
