@@ -1177,15 +1177,26 @@ def generate_agent_sub_prompt(task_name: str) -> str:
     return f"--- SUB-AGENT PROMPT ---\n{prompt}\n--- END PROMPT ---"
 
 @mcp.tool()
-def add_resource(name: str, resource_type: str, cost_rate: float, description: str = "") -> str:
+def add_resource(name: str, resource_type: str, cost_rate, description: str = "") -> str:
     """
     Adds a resource (HUMAN or EQUIPMENT) to the engine.
+    cost_rate must be a positive number (e.g. 100.0). If a string like '$100/day' is
+    passed, the engine will attempt to extract the numeric portion automatically.
     """
     if resource_type.upper() not in ["HUMAN", "EQUIPMENT"]:
         return "Error: resource_type must be 'HUMAN' or 'EQUIPMENT'."
     
+    # Defensive coercion: strip currency symbols, commas, units (e.g. '$100/day' -> 100.0)
+    if isinstance(cost_rate, str):
+        import re as _re
+        cleaned = _re.sub(r"[^\d.]", "", cost_rate.split("/")[0])
+        try:
+            cost_rate = float(cleaned)
+        except ValueError:
+            return f"Error: cost_rate '{cost_rate}' could not be parsed as a number. Please provide a plain numeric value (e.g. 100.0)."
+    
     query = "MERGE (r:Resource {name: $name, type: $type, cost_rate: $cost_rate, description: $description})"
-    params = {"name": name, "type": resource_type.upper(), "cost_rate": cost_rate, "description": description}
+    params = {"name": name, "type": resource_type.upper(), "cost_rate": float(cost_rate), "description": description}
     return safe_cypher_read(query, params)
 
 @mcp.tool()
@@ -1664,6 +1675,69 @@ def get_task_parents(task_name: str, depth: int = 1, include_resources: bool = F
     if count == 0:
         return f"No upstream parents found for '{task_name}' within depth {depth}."
     return table
+
+
+
+# ─── Phase 13: Data Purging & Lifecycle ───────────────────────────────────────
+
+def _safe_delete_edges(node_label: str, key_property: str, value: str, edge_labels: list):
+    """Severs edges in both directions for a node before deletion."""
+    for rel in edge_labels:
+        # Outgoing
+        try:
+            conn.execute(f"MATCH (n:{node_label} {{{key_property}: $val}})-[r:{rel}]->() DELETE r", {"val": value})
+        except:
+            pass
+        # Incoming
+        try:
+            conn.execute(f"MATCH (n:{node_label} {{{key_property}: $val}})<-[r:{rel}]-() DELETE r", {"val": value})
+        except:
+            pass
+
+@mcp.tool()
+def delete_task(task_name: str) -> str:
+    """Safely deletes a task after severing all dependencies and assignments."""
+    _safe_delete_edges("Task", "name", task_name, ["DEPENDS_ON", "WORKS_ON", "REQUIRES_SKILL", "CONTAINS"])
+    res = conn.execute("MATCH (t:Task {name: $name}) DELETE t RETURN count(*)", {"name": task_name})
+    if res.has_next() and res.get_next()[0] > 0:
+        return f"Task '{task_name}' has been deleted."
+    return f"Error: Task '{task_name}' not found."
+
+@mcp.tool()
+def delete_resource(resource_name: str) -> str:
+    """Safely deletes a resource after severing all assignments and skills."""
+    _safe_delete_edges("Resource", "name", resource_name, ["WORKS_ON", "HAS_SKILL"])
+    res = conn.execute("MATCH (r:Resource {name: $name}) DELETE r RETURN count(*)", {"name": resource_name})
+    if res.has_next() and res.get_next()[0] > 0:
+        return f"Resource '{resource_name}' has been deleted."
+    return f"Error: Resource '{resource_name}' not found."
+
+@mcp.tool()
+def delete_skill(skill_name: str) -> str:
+    """Safely deletes a skill after severing all possession and requirement links."""
+    _safe_delete_edges("Skill", "name", skill_name, ["HAS_SKILL", "REQUIRES_SKILL"])
+    res = conn.execute("MATCH (s:Skill {name: $name}) DELETE s RETURN count(*)", {"name": skill_name})
+    if res.has_next() and res.get_next()[0] > 0:
+        return f"Skill '{skill_name}' has been deleted."
+    return f"Error: Skill '{skill_name}' not found."
+
+@mcp.tool()
+def delete_project(project_id: str) -> str:
+    """Deletes a project and all its contained tasks (cascading)."""
+    # 1. Fetch all tasks in project
+    task_res = conn.execute("MATCH (p:Project {id: $id})-[:CONTAINS]->(t:Task) RETURN t.name", {"id": project_id})
+    tasks_deleted = 0
+    while task_res.has_next():
+        t_name = task_res.get_next()[0]
+        delete_task(t_name)
+        tasks_deleted += 1
+    
+    # 2. Sever project's own edges and delete
+    _safe_delete_edges("Project", "id", project_id, ["CONTAINS"])
+    res = conn.execute("MATCH (p:Project {id: $id}) DELETE p RETURN count(*)", {"id": project_id})
+    if res.has_next() and res.get_next()[0] > 0:
+        return f"Project '{project_id}' deleted. Cascaded cleanup removed {tasks_deleted} tasks."
+    return f"Error: Project '{project_id}' not found."
 
 
 @mcp.resource("system://info")

@@ -30,6 +30,8 @@ Rules:
 3. Visuals: 🔨 SKILL  🪏 TASK  👤 RESOURCE  📅 DATES
 4. If a tool call returns an error, analyse and retry with corrected arguments.
 5. Kuzu Cypher: NEVER use CALL procedures. Query nodes directly, e.g. MATCH (p:Project) RETURN p.id, p.name
+6. CRITICAL — Numeric arguments: ALWAYS strip currency symbols and units before passing to tools. '$100/day' must be passed as 100.0. '$1,500' must be 1500.0. Never pass strings where a number is required.
+7. CRITICAL — Resource names with underscores: pass the name exactly as written (e.g. 'Sir_Chews_A_Lot'), do NOT replace underscores with spaces.
 """
 
 CANNED_QUERIES = {
@@ -204,7 +206,7 @@ def render_query_result(raw):
     try:
         parsed = ast.literal_eval(str(text))
         if isinstance(parsed, list) and parsed:
-            st.dataframe(parsed, use_container_width=True)
+            st.dataframe(parsed, width='stretch')
         else:
             st.info("Query returned no rows.")
     except (ValueError, SyntaxError):

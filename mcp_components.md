@@ -63,6 +63,14 @@ This document provides a functional description of every `@mcp.tool()` and `@mcp
 | `get_task_children` | `(task_name, depth=1, include_resources=False)` | Traverses downstream `DEPENDS_ON` relationships. |
 | `get_task_parents` | `(task_name, depth=1, include_resources=False)` | Traverses upstream `DEPENDS_ON` relationships. |
 
+### Data Purging & Lifecycle (Phase 13)
+| Tool | Signature | Purpose |
+|---|---|---|
+| `delete_task` | `(task_name)` | Severs dependencies and deletes a task node. |
+| `delete_resource` | `(resource_name)` | Severs assignments and deletes a resource node. |
+| `delete_skill` | `(skill_name)` | Severs possession links and deletes a skill node. |
+| `delete_project` | `(project_id)` | Cascading delete of project and all contained tasks. |
+
 ---
 
 ## Resources (Read-Only Context URIs)

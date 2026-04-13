@@ -50,7 +50,14 @@ These tools allow the LLM to mutate the database, calculate math, and orchestrat
 * generate_agent_sub_prompt(task_name): Reads task requirements and outputs a strict prompt designed to instruct a sub-agent to do the work.  
 * ping(): Basic health check to verify MCP server connectivity.
 
-### **6. Entity Inspection Tools (Phase 11)**
+### **6. Data Purging & Lifecycle (Phase 13)**
+
+* delete_task(task_name): Safely deletes a task after severing all dependencies, resource assignments, and project containment links.
+* delete_resource(resource_name): Safely deletes a resource after severing all assignments and skill links.
+* delete_skill(skill_name): Safely deletes a skill after severing all possession and requirement links.
+* delete_project(project_id): Deletes a project and all its contained tasks (cascading cleanup).
+
+### **7. Entity Inspection Tools (Phase 11)**
 
 * list_projects(): Lists all projects in the system as a Markdown table (| Project ID | Name | Start Date |).  
 * list_tasks(project_id=None): Lists tasks globally or filtered by project as a Markdown table (| Task Name | Duration | Status | Start Date | End Date |).  
