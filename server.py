@@ -551,7 +551,8 @@ def get_evm_report(project_id: str) -> str:
             "pv": pv,
             "ev": ev,
             "ac": ac,
-            "pct": pct
+            "pct": pct,
+            "b_cost": b_cost
         })
 
     if not tasks_stats:
@@ -560,10 +561,23 @@ def get_evm_report(project_id: str) -> str:
     spi = total_ev / total_pv if total_pv > 0 else 1.0
     cpi = total_ev / total_ac if total_ac > 0 else 1.0
     
+    # NEW FORECAST MATH (Phase 22)
+    total_bac = sum(s['b_cost'] for s in tasks_stats)
+    eac = total_bac / cpi if cpi > 0 else total_bac + total_ac
+    vac = total_bac - eac
+    
     report = f"# EVM Report: Project {project_id} ({today})\n\n"
     report += f"- **Total Planned Value (PV)**: ${total_pv:,.2f}\n"
     report += f"- **Total Earned Value (EV)**: ${total_ev:,.2f}\n"
     report += f"- **Total Actual Cost (AC)**: ${total_ac:,.2f}\n"
+    report += f"- **Budget At Completion (BAC)**: ${total_bac:,.2f}\n\n"
+    
+    report += "### 🔮 Forecasting Metrics\n"
+    report += f"- **Estimate At Completion (EAC)**: ${eac:,.2f} *(Expected final cost based on current CPI)*\n"
+    report += f"- **Variance At Completion (VAC)**: ${vac:,.2f} "
+    report += "(Expected Overage)" if vac < 0 else "(Expected Savings)"
+    report += "\n\n"
+    
     report += f"- **Schedule Performance Index (SPI)**: {spi:.2f} "
     report += "(Ahead of schedule)" if spi > 1.05 else "(Behind schedule)" if spi < 0.95 else "(On schedule)"
     report += "\n"
@@ -2235,6 +2249,86 @@ def analyze_root_cause(project_id: str) -> str:
     if not found_slip:
         return report + "Critical path is healthy and aligned with baseline."
     return report
+
+@mcp.tool()
+def get_unassigned_tasks(project_id: str) -> str:
+    """
+    Returns a list of all tasks in a project that currently have no resources assigned.
+    Useful for identifying gaps in project planning.
+    """
+    query = """
+    MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
+    WHERE NOT (t)<-[:WORKS_ON]-(:Resource)
+    RETURN t.name, t.duration, t.cost, t.status, t.est_date
+    """
+    try:
+        res = conn.execute(query, {"pid": project_id})
+        orphaned_tasks = []
+        while res.has_next():
+            row = res.get_next()
+            orphaned_tasks.append({
+                "task": row[0],
+                "duration": row[1],
+                "cost": row[2],
+                "status": row[3],
+                "start_date": row[4]
+            })
+            
+        return create_response(
+            operation="get_unassigned_tasks",
+            status="success",
+            data={
+                "project_id": project_id, 
+                "unassigned_tasks": orphaned_tasks,
+                "count": len(orphaned_tasks)
+            }
+        )
+    except Exception as e:
+        return create_response("get_unassigned_tasks", "error", warnings=[f"Database error: {str(e)}"])
+
+@mcp.tool()
+def get_resource_timeline(resource_name: str) -> str:
+    """
+    Returns a timeline of tasks and allocations for a specific resource.
+    Provides the exact intervals of their workload across all projects.
+    """
+    query = """
+    MATCH (r:Resource {name: $name})-[w:WORKS_ON]->(t:Task)
+    OPTIONAL MATCH (p:Project)-[:CONTAINS]->(t)
+    RETURN t.name, p.id, t.est_date, t.eft_date, w.allocation, t.status
+    ORDER BY t.est_date
+    """
+    try:
+        res = conn.execute(query, {"name": resource_name})
+        timeline = []
+        total_assignments = 0
+        
+        while res.has_next():
+            row = res.get_next()
+            timeline.append({
+                "task": row[0],
+                "project_id": row[1],
+                "start_date": row[2],
+                "end_date": row[3],
+                "allocation": row[4],
+                "status": row[5]
+            })
+            total_assignments += 1
+            
+        if total_assignments == 0:
+             return create_response("get_resource_timeline", "success", warnings=[f"Resource '{resource_name}' has no active task assignments."])
+               
+        return create_response(
+            operation="get_resource_timeline",
+            status="success",
+            data={
+                "resource": resource_name,
+                "assignments": timeline,
+                "count": total_assignments
+            }
+        )
+    except Exception as e:
+        return create_response("get_resource_timeline", "error", warnings=[f"Database error: {str(e)}"])
 
 @mcp.tool()
 def simulate_impact(project_id: str, task_name: str, added_duration: int) -> str:

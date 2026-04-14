@@ -41,6 +41,8 @@ These tools allow the LLM to mutate the database, calculate math, and orchestrat
 * update_estimates(task_name, optimistic, pessimistic): Updates the optimistic and pessimistic durations of a task for PERT analysis.
 * run_pert_analysis(project_id): Mathematically calculates expected_duration using 3-point estimates for all tasks.  
 * auto_level_schedule(project_id): Runs the heuristic sweep-line solver to shift tasks with positive float, resolving resource over-allocations.
+* get_unassigned_tasks(project_id): Returns a list of all tasks in a project that currently have no resources assigned.
+* get_resource_timeline(resource_name): Returns a chronological list of a resource's assignments across all projects, including the exact allocation percentages.
 
 ### **5. Enterprise Portfolio & Integrations**
 
@@ -92,7 +94,7 @@ These URIs can be fetched by the LLM at any time to gain immediate context about
 * project://{project_id}/reports/budget: Financial breakdown aggregating fixed costs and calculated resource costs (cost_rate * duration * allocation).  
 * project://{project_id}/reports/allocation: Sweep-line analysis showing exact YYYY-MM-DD windows where resources exceed 100% capacity within the project.  
 * portfolio://reports/allocation: Global sweep-line analysis detecting bottlenecks across *all* active projects in the database.  
-* project://{project_id}/reports/evm: Earned Value Management report displaying Planned Value (PV), Earned Value (EV), Actual Cost (AC), SPI, and CPI.  
+* project://{project_id}/reports/evm: Earned Value Management report displaying Planned Value (PV), Earned Value (EV), Actual Cost (AC), SPI, CPI, and predictive EAC/VAC forecasting.  
 * project://{project_id}/reports/risk: PERT analysis report highlighting tasks with dangerously high statistical variance on the timeline.
 
 ### **Dynamic Custom Reports (Phase 16)**
