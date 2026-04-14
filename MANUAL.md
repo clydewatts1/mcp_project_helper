@@ -102,3 +102,32 @@ The project engine permits autonomous LLM workers to author and register their o
 * `custom://reports`: Lists all user/AI registered custom analytical reports and their operational health status.
 * **Relevant Tools**: `register_custom_report`, `run_custom_report`, `debug_custom_report`.
 * **Security Constraints**: Reports are validated for syntax upon registration (`LIMIT 1`). Execution of structural mutation commands (e.g. `CREATE`, `SET`) are universally blocked.
+
+### **Agentic Ergonomics & Batch Operations (Phase 17)**
+
+To optimize for autonomous agents and prevent timeouts, several tools now support JSON-based batching and explicit tool wrappers for core analytics.
+
+* **Batch Tools**:
+    - `add_tasks_batch(project_id, tasks_json)`: Bulk create tasks. `tasks_json` is an array of objects: `[{"name": "T1", "duration": 5, "cost": 100}, ...]`.
+    - `create_dependencies_batch(dependencies_json)`: Bulk create dependencies. `dependencies_json` is an array of objects: `[{"source": "A", "target": "B", "lag": 0}, ...]`.
+* **Resource Wrappers (Explicit Tools)**:
+    - `get_database_schema_tool()`: Tool-ified version of `system://schema`.
+    - `get_evm_report_tool(project_id)`: Tool-ified version of `project://{id}/reports/evm`.
+    - `get_risk_report_tool(project_id)`: Tool-ified version of `project://{id}/reports/risk`.
+    - `get_project_summary(project_id)`: Tool-ified project briefing (formerly webhook).
+* **Enhanced CRUD**:
+    - `update_task(task_name, duration, cost, description)`: Granularly modify task attributes without deletion. Recalculates timeline automatically if duration changes.
+    - `set_task_progress(task_name, percent_complete)`: Now automatically cycles status between `AI_DRAFT`, `IN_PROGRESS`, and `DONE` based on percentage.
+
+### **Advanced Diagnostics & Visualization (Phase 18)**
+
+Optimized for high-speed agents and visual density analysis.
+
+* **Diagnostic Tools**:
+    - `get_project_delta(project_id)`: Returns only tasks that have slipped their baseline/budget.
+    - `semantic_task_search(keyword)`: Broad keyword search across all task names/descriptions.
+    - `analyze_root_cause(project_id)`: Identifies specific shifted tasks on the Critical Path causing delays.
+    - `simulate_impact(project_id, task_name, added_duration)`: "Dry-run" simulation of schedule changes without mutating the graph.
+    - `generate_human_decision_prompt(task_name, conflict_description)`: Structured escalation templates for human intervention.
+* **Visual Resources**:
+    - `project://{project_id}/state/export/gantt`: Generates a high-fidelity **Gantt Chart** PNG image.

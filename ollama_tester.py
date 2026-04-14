@@ -216,8 +216,22 @@ def run_llm_loop(system_prompt: str, selected_model: str = "llama3.2"):
                 except Exception:
                     st.code(content)
         elif role == "tool_result":
-            with st.expander(f"📤 Result: **{tool_name}**", expanded=False):
-                st.write(content)
+            try:
+                res_json = json.loads(content)
+                status = res_json.get("status", "unknown")
+                color = "green" if status == "success" else "orange" if status == "warning" else "red"
+                
+                with st.expander(f"📤 Result: {tool_name} (:{color}[{status.upper()}])", expanded=(status == "error")):
+                    if res_json.get("warnings"):
+                        for w in res_json["warnings"]:
+                            st.warning(w)
+                    if res_json.get("data"):
+                        st.json(res_json["data"])
+                    else:
+                        st.write(content)
+            except Exception:
+                with st.expander(f"📤 Result: **{tool_name}**", expanded=False):
+                    st.write(content)
 
 
 # ─── Result rendering ─────────────────────────────────────────────────────────

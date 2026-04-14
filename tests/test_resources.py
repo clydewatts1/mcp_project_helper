@@ -1,4 +1,5 @@
 import numpy as np
+import json
 
 def test_skill_mismatch(isolated_server):
     s = isolated_server
@@ -9,8 +10,10 @@ def test_skill_mismatch(isolated_server):
     
     s.add_resource("Bob", "HUMAN", 100.0)
     # Bob doesn't have Python skill
-    res = s.assign_resource("Bob", "CodeTask", 100)
-    assert "[WARNING: Skill Mismatch]" in res
+    res_str = s.assign_resource("Bob", "CodeTask", 100)
+    res = json.loads(res_str)
+    assert res["status"] == "warning"
+    assert any("Skill Mismatch" in w for w in res["warnings"])
 
 def test_auto_leveler(isolated_server):
     s = isolated_server
@@ -30,8 +33,9 @@ def test_auto_leveler(isolated_server):
     assert "Conflict Window" in report
     
     # Run leveling
-    level_res = s.auto_level_schedule("P_LEVEL")
-    assert "Schedule Leveled Successfully" in level_res
+    level_res_str = s.auto_level_schedule("P_LEVEL")
+    level_res = json.loads(level_res_str)
+    assert level_res["status"] == "success"
     
     # Check TaskB new dates
     # TaskA: Mon-Tue

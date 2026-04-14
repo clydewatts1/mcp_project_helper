@@ -4,12 +4,30 @@ import base64
 import datetime
 import graphviz
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import io
 import kuzu
 from collections import deque
 from mcp.server.fastmcp import FastMCP
 
 # Initialize FastMCP
 mcp = FastMCP("ProjectLogicEngine")
+
+def create_response(operation: str, status: str, data: dict = None, warnings: list = None) -> str:
+    """
+    Standardized JSON envelope for all MCP tool responses.
+    Status should be 'success', 'warning', or 'error'.
+    """
+    response = {
+        "status": status,
+        "operation": operation,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "affected_rows": data.get("count", 1) if data else 0,
+        "warnings": warnings or [],
+        "data": data or {}
+    }
+    return json.dumps(response, indent=2)
 
 # Initialize Kuzu Database (Phase 1 Step 1)
 db = kuzu.Database('./project_data.kuzu')
@@ -53,7 +71,13 @@ def initialize_schema():
         "ALTER TABLE Task ADD pessimistic_duration INT",
         "ALTER TABLE Task ADD expected_duration DOUBLE",
         "ALTER TABLE Task ADD total_float INT DEFAULT 0",
-        "ALTER TABLE Task ADD leveling_delay INT DEFAULT 0"
+        "ALTER TABLE Task ADD leveling_delay INT DEFAULT 0",
+        "ALTER TABLE Task ADD project_id STRING",
+        "ALTER TABLE Task ADD pert_std_dev DOUBLE",
+        "ALTER TABLE Task ADD pert_variance DOUBLE",
+        "CREATE INDEX IF NOT EXISTS ON Task(project_id)",
+        "CREATE INDEX IF NOT EXISTS ON Task(status)",
+        "CREATE INDEX IF NOT EXISTS ON Resource(type)"
     ]
     
     for q in migration_queries:
@@ -61,6 +85,11 @@ def initialize_schema():
             conn.execute(q)
         except:
             pass
+
+    try:
+        conn.execute("MATCH (p:Project)-[:CONTAINS]->(t:Task) WHERE t.project_id IS NULL SET t.project_id = p.id")
+    except Exception:
+        pass
 
 # Run schema initialization on startup
 initialize_schema()
@@ -331,8 +360,8 @@ def lock_task(task_name: str) -> str:
         RETURN t.name
     """, {"name": task_name})
     if res.has_next():
-        return f"Task '{task_name}' is now LOCKED. Auto-scheduler will report conflicts instead of moving it."
-    return f"Error: Task '{task_name}' not found."
+        return create_response("lock_task", "success", data={"task": task_name, "status": "HUMAN_LOCKED"})
+    return create_response("lock_task", "error", warnings=[f"Task '{task_name}' not found."])
 
 @mcp.tool()
 def baseline_project(project_id: str) -> str:
@@ -350,22 +379,109 @@ def baseline_project(project_id: str) -> str:
     res = conn.execute(query, {"id": project_id})
     if res.has_next():
         count = res.get_next()[0]
-        return f"Successfully baselined {count} tasks for project '{project_id}'."
-    return f"No tasks found for project '{project_id}'."
+        if count == 0:
+            return create_response("baseline_project", "warning", warnings=[f"No tasks found for project '{project_id}'."])
+        return create_response("baseline_project", "success", data={"project_id": project_id, "count": count})
+    return create_response("baseline_project", "error", warnings=[f"Project '{project_id}' not found."])
 
 @mcp.tool()
 def set_task_progress(task_name: str, percent_complete: int) -> str:
-    """Updates the completion percentage of a task (0-100)."""
-    if not (0 <= percent_complete <= 100):
-        return "Error: percent_complete must be between 0 and 100."
+    """Updates completion percentage (0-100) and automatically transitions the status."""
+    if not (0 <= percent_complete <= 100): 
+        return create_response("set_task_progress", "error", warnings=["percent_complete must be 0-100."])
+    
+    status = "IN_PROGRESS"
+    if percent_complete == 100: status = "DONE"
+    elif percent_complete == 0: status = "AI_DRAFT"
+    
     res = conn.execute("""
         MATCH (t:Task {name: $name})
-        SET t.percent_complete = $pct
+        SET t.percent_complete = $pct, t.status = $status
         RETURN t.name
-    """, {"name": task_name, "pct": percent_complete})
-    if res.has_next():
-        return f"Task '{task_name}' progress updated to {percent_complete}%."
-    return f"Error: Task '{task_name}' not found."
+    """, {"name": task_name, "pct": percent_complete, "status": status})
+    
+    if res.has_next(): 
+        return create_response("set_task_progress", "success", data={"task": task_name, "percent": percent_complete, "status": status})
+    return create_response("set_task_progress", "error", warnings=[f"Task '{task_name}' not found."])
+
+@mcp.tool()
+def update_task(task_name: str, duration: int = None, cost: float = None, description: str = None) -> str:
+    """Updates an existing task's attributes. Only pass the values you want to change."""
+    updates = []
+    params = {"name": task_name}
+    if duration is not None:
+        updates.append("t.duration = $duration")
+        params["duration"] = int(duration)
+    if cost is not None:
+        updates.append("t.cost = $cost")
+        params["cost"] = float(cost)
+    if description is not None:
+        updates.append("t.description = $desc")
+        params["desc"] = description
+        
+    if not updates:
+        return create_response("update_task", "warning", warnings=["No updates provided."])
+        
+    query = f"MATCH (t:Task {{name: $name}}) SET {', '.join(updates)} RETURN t.name"
+    res = conn.execute(query, params)
+    
+    if not res.has_next():
+        return create_response("update_task", "error", warnings=[f"Task '{task_name}' not found."])
+    
+    warnings = []
+    # Recalculate timeline if duration changed
+    if duration is not None:
+        proj_res = conn.execute("MATCH (t:Task {name: $name}) RETURN t.project_id", {"name": task_name})
+        if proj_res.has_next():
+            pid = proj_res.get_next()[0]
+            conflicts = _recalculate_timeline(pid)
+            if conflicts:
+                warnings.extend(conflicts)
+            
+    status = "warning" if warnings else "success"
+    return create_response("update_task", status, data={"task": task_name}, warnings=warnings)
+
+
+# ─── Advanced Agentic PM Tools (Phase 18) ───────────────────────────────────
+
+@mcp.tool()
+def get_project_delta(project_id: str) -> str:
+    """Returns ONLY the tasks that have slipped their baseline schedule or budget."""
+    query = """
+    MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
+    WHERE (t.est_date > t.baseline_est_date) OR (t.actual_cost > t.baseline_cost)
+    RETURN t.name, t.est_date, t.baseline_est_date, t.actual_cost, t.baseline_cost
+    """
+    res = conn.execute(query, {"pid": project_id})
+    table = "| Task | Current Start | Baseline Start | Actual Cost | Baseline Cost |\n|---|---|---|---|---|\n"
+    count = 0
+    while res.has_next():
+        row = res.get_next()
+        table += f"| {row[0]} | {row[1]} | {row[2]} | ${row[3] or 0} | ${row[4] or 0} |\n"
+        count += 1
+    if count == 0: return "No deviations from baseline detected."
+    return table
+
+@mcp.tool()
+def semantic_task_search(keyword: str) -> str:
+    """Searches task names and descriptions across the database for a keyword."""
+    # Using simple CONTAINS for broad matching
+    query = """
+    MATCH (p:Project)-[:CONTAINS]->(t:Task)
+    WHERE t.name CONTAINS $kw OR t.description CONTAINS $kw
+    RETURN p.id, t.name, t.description, t.status
+    """
+    res = conn.execute(query, {"kw": keyword})
+    table = "| Project | Task | Description | Status |\n|---|---|---|---|\n"
+    count = 0
+    while res.has_next():
+        row = res.get_next()
+        table += f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} |\n"
+        count += 1
+    if count == 0: return f"No tasks found matching keyword '{keyword}'."
+    return table
+
+
 
 @mcp.tool()
 def update_task_actual_cost(task_name: str, actual_cost: float) -> str:
@@ -376,8 +492,8 @@ def update_task_actual_cost(task_name: str, actual_cost: float) -> str:
         RETURN t.name
     """, {"name": task_name, "cost": actual_cost})
     if res.has_next():
-        return f"Task '{task_name}' actual cost updated to ${actual_cost:,.2f}."
-    return f"Error: Task '{task_name}' not found."
+        return create_response("update_task_actual_cost", "success", data={"task": task_name, "actual_cost": actual_cost})
+    return create_response("update_task_actual_cost", "error", warnings=[f"Task '{task_name}' not found."])
 
 @mcp.resource("project://{project_id}/reports/evm")
 def get_evm_report(project_id: str) -> str:
@@ -875,7 +991,7 @@ def create_project(project_id: str, start_date: str, name: str) -> str:
     start_date must be in YYYY-MM-DD format.
     """
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", start_date):
-        return "Error: start_date must be in YYYY-MM-DD format."
+        return create_response("create_project", "error", warnings=[f"Invalid date format: {start_date}."])
     
     query = """
     MERGE (p:Project {id: $id})
@@ -883,8 +999,8 @@ def create_project(project_id: str, start_date: str, name: str) -> str:
     RETURN p.id
     """
     params = {"id": project_id, "start_date": start_date, "name": name}
-    res = safe_cypher_read(query, params)
-    return f"Project created/updated: {res}"
+    conn.execute(query, params)
+    return create_response("create_project", "success", data={"project_id": project_id, "name": name, "start_date": start_date})
 
 @mcp.tool()
 def add_task(project_id: str, name: str, duration, cost, description: str = "", optimistic: int = None, pessimistic: int = None) -> str:
@@ -895,7 +1011,7 @@ def add_task(project_id: str, name: str, duration, cost, description: str = "", 
         duration = int(duration)
         cost = float(cost)
     except ValueError:
-        return "Error: duration must be an integer and cost must be a number."
+        return create_response("add_task", "error", warnings=["duration must be integer, cost must be number."])
 
     # Default PERT estimates to the provided duration if not specified
     opt = optimistic if optimistic is not None else duration
@@ -905,7 +1021,8 @@ def add_task(project_id: str, name: str, duration, cost, description: str = "", 
     query = """
     MATCH (p:Project {id: $project_id})
     MERGE (t:Task {name: $name})
-    SET t.description = $description,
+    SET t.project_id = $project_id,
+        t.description = $description,
         t.duration = $duration,
         t.optimistic_duration = $opt,
         t.pessimistic_duration = $pess,
@@ -929,11 +1046,19 @@ def add_task(project_id: str, name: str, duration, cost, description: str = "", 
         "cost": cost,
         "description": description
     }
-    res = safe_cypher_read(query, params)
+    res = conn.execute(query, params)
+    if not res.has_next():
+         return create_response("add_task", "error", warnings=[f"Project '{project_id}' not found. Create project first."])
+         
     conflicts = _recalculate_timeline(project_id)
-    if conflicts:
-        res += "\n" + "\n".join(conflicts)
-    return res
+    status = "warning" if conflicts else "success"
+    
+    return create_response(
+        operation="add_task",
+        status=status,
+        data={"task": name, "project": project_id},
+        warnings=conflicts
+    )
 
 @mcp.tool()
 def create_dependency(source_name: str, target_name: str = None, target_names: list = None, lag: int = 0) -> str:
@@ -947,50 +1072,73 @@ def create_dependency(source_name: str, target_name: str = None, target_names: l
     # Fan-out: handle list form defensively
     if target_name is None and target_names:
         results = []
+        all_warnings = []
         for t in target_names:
-            results.append(create_dependency(source_name=source_name, target_name=t, lag=lag))
-        return "\n".join(results)
+            res_str = create_dependency(source_name=source_name, target_name=t, lag=lag)
+            res_json = json.loads(res_str)
+            if res_json.get("status") == "error":
+                return res_str # Bubble up hard errors during fan-out
+            results.append(res_json.get("data", {}))
+            all_warnings.extend(res_json.get("warnings", []))
+        
+        status = "warning" if all_warnings else "success"
+        return create_response("create_dependency", status, data={"source": source_name, "dependencies": results}, warnings=all_warnings)
+        
     if target_name is None:
-        return "Error: target_name is required."
+        return create_response("create_dependency", "error", warnings=["target_name is required."])
 
     # Validate node existence
-    s_exists = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": source_name}).get_next()[0]
-    if s_exists == 0:
-        return f"Error: Source task '{source_name}' not found. Call 'add_task' to create it."
+    s_id = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": source_name}).get_next()[0]
+    if s_id == 0:
+        return create_response("create_dependency", "error", warnings=[f"Source task '{source_name}' not found."])
         
-    t_exists = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": target_name}).get_next()[0]
-    if t_exists == 0:
-        return f"Error: Target task '{target_name}' not found. Call 'add_task' to create it."
+    t_id = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": target_name}).get_next()[0]
+    if t_id == 0:
+        return create_response("create_dependency", "error", warnings=[f"Target task '{target_name}' not found."])
 
     # Gate 1: Cycle Check
-    check_query = "MATCH path=(t:Task {name: $target_name})-[*]->(s:Task {name: $source_name}) RETURN count(path)"
+    check_query = "MATCH path=(t:Task {name: $target_name})-[*]->(s:Task {name: $source_name}) RETURN nodes(path)"
     try:
         check_res = conn.execute(check_query, {"source_name": source_name, "target_name": target_name})
         if check_res.has_next():
-            path_count = check_res.get_next()[0]
-            if path_count > 0:
-                return "Law I Violation: Circular Dependency. Linking these creates a cycle. Do NOT attempt to create this specific dependency again. Re-evaluate your plan."
+            nodes = check_res.get_next()[0]
+            try:
+                path_names = [n['name'] for n in nodes]
+            except (TypeError, KeyError):
+                path_names = [getattr(n, 'name', str(n)) for n in nodes]
+                
+            return create_response(
+                operation="create_dependency",
+                status="error",
+                data={"cycle_path": path_names},
+                warnings=["Law I Violation: Circular Dependency Detected."]
+            )
     except Exception as e:
-         return f"Kuzu Error during Cycle Check: {str(e)}"
+         return create_response("create_dependency", "error", warnings=[f"Kuzu Error in cycle check: {str(e)}"])
 
     # Gate 2: Create Edge
     query = """
     MATCH (a:Task {name: $source_name}), (b:Task {name: $target_name})
     MERGE (a)-[r:DEPENDS_ON {lag: $lag}]->(b)
-    RETURN r.lag
+    RETURN count(r)
     """
-    res = safe_cypher_read(query, {"source_name": source_name, "target_name": target_name, "lag": lag})
+    conn.execute(query, {"source_name": source_name, "target_name": target_name, "lag": lag})
       
     # Trigger recalculation
     proj_query = "MATCH (p:Project)-[:CONTAINS]->(t:Task {name: $name}) RETURN p.id"
     proj_res = conn.execute(proj_query, {"name": source_name})
+    conflicts = []
     if proj_res.has_next():
         project_id = proj_res.get_next()[0]
         conflicts = _recalculate_timeline(project_id)
-        if conflicts:
-            res += "\n" + "\n".join(conflicts)
               
-    return res
+    status = "warning" if conflicts else "success"
+    return create_response(
+        operation="create_dependency",
+        status=status,
+        data={"source": source_name, "target": target_name, "lag": lag},
+        warnings=conflicts
+    )
 
 @mcp.tool()
 def update_estimates(task_name: str, optimistic: int, pessimistic: int) -> str:
@@ -1001,8 +1149,8 @@ def update_estimates(task_name: str, optimistic: int, pessimistic: int) -> str:
         RETURN t.name
     """, {"name": task_name, "opt": optimistic, "pess": pessimistic})
     if res.has_next():
-        return f"PERT estimates updated for task '{task_name}'."
-    return f"Error: Task '{task_name}' not found."
+        return create_response("update_estimates", "success", data={"task": task_name, "optimistic": optimistic, "pessimistic": pessimistic})
+    return create_response("update_estimates", "error", warnings=[f"Task '{task_name}' not found."])
 
 @mcp.tool()
 def run_pert_analysis(project_id: str) -> str:
@@ -1012,14 +1160,24 @@ def run_pert_analysis(project_id: str) -> str:
     """
     query = """
     MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
-    SET t.expected_duration = (CAST(t.optimistic_duration AS DOUBLE) + (4.0 * CAST(t.duration AS DOUBLE)) + CAST(t.pessimistic_duration AS DOUBLE)) / 6.0
+    WITH t, 
+         (CAST(t.optimistic_duration AS DOUBLE) + (4.0 * CAST(t.duration AS DOUBLE)) + CAST(t.pessimistic_duration AS DOUBLE)) / 6.0 AS expected,
+         (CAST(t.pessimistic_duration AS DOUBLE) - CAST(t.optimistic_duration AS DOUBLE)) / 6.0 AS std_dev
+    SET t.expected_duration = expected,
+        t.pert_std_dev = std_dev,
+        t.pert_variance = std_dev * std_dev
     RETURN count(t)
     """
     res = conn.execute(query, {"pid": project_id})
     if res.has_next():
         count = res.get_next()[0]
-        return f"PERT analysis complete for {count} tasks in project '{project_id}'."
-    return f"No tasks found for project '{project_id}'."
+        if count == 0:
+            return create_response("run_pert_analysis", "warning", warnings=[f"No tasks found for project '{project_id}'."])
+            
+        conflicts = _recalculate_timeline(project_id)
+        status = "warning" if conflicts else "success"
+        return create_response("run_pert_analysis", status, data={"project_id": project_id, "tasks_analyzed": count}, warnings=conflicts)
+    return create_response("run_pert_analysis", "error", warnings=[f"Project '{project_id}' not found."])
 
 @mcp.resource("project://{project_id}/reports/risk")
 def get_risk_report(project_id: str) -> str:
@@ -1215,7 +1373,7 @@ def add_resource(name: str, resource_type: str, cost_rate, description: str = ""
     passed, the engine will attempt to extract the numeric portion automatically.
     """
     if resource_type.upper() not in ["HUMAN", "EQUIPMENT"]:
-        return "Error: resource_type must be 'HUMAN' or 'EQUIPMENT'."
+        return create_response("add_resource", "error", warnings=[f"Invalid resource_type: {resource_type}. Must be HUMAN or EQUIPMENT."])
     
     # Defensive coercion: strip currency symbols, commas, units (e.g. '$100/day' -> 100.0)
     if isinstance(cost_rate, str):
@@ -1224,11 +1382,12 @@ def add_resource(name: str, resource_type: str, cost_rate, description: str = ""
         try:
             cost_rate = float(cleaned)
         except ValueError:
-            return f"Error: cost_rate '{cost_rate}' could not be parsed as a number. Please provide a plain numeric value (e.g. 100.0)."
+            return create_response("add_resource", "error", warnings=[f"cost_rate '{cost_rate}' could not be parsed as a number."])
     
     query = "MERGE (r:Resource {name: $name, type: $type, cost_rate: $cost_rate, description: $description})"
     params = {"name": name, "type": resource_type.upper(), "cost_rate": float(cost_rate), "description": description}
-    return safe_cypher_read(query, params)
+    conn.execute(query, params)
+    return create_response("add_resource", "success", data={"resource": name, "type": resource_type.upper()})
 
 @mcp.tool()
 def add_skill(name: str, description: str = "") -> str:
@@ -1237,7 +1396,8 @@ def add_skill(name: str, description: str = "") -> str:
     """
     query = "MERGE (s:Skill {name: $name, description: $description})"
     params = {"name": name, "description": description}
-    return safe_cypher_read(query, params)
+    conn.execute(query, params)
+    return create_response("add_skill", "success", data={"skill": name})
 
 @mcp.tool()
 def grant_skill(resource_name: str, skill_name: str, proficiency: str = "Intermediate") -> str:
@@ -1246,11 +1406,11 @@ def grant_skill(resource_name: str, skill_name: str, proficiency: str = "Interme
     """
     s_exists = conn.execute("MATCH (s:Skill {name: $name}) RETURN count(*)", {"name": skill_name}).get_next()[0]
     if s_exists == 0:
-        return f"Error: Skill '{skill_name}' does not exist. Call 'add_skill' to register this capability first."
+        return create_response("grant_skill", "error", warnings=[f"Skill '{skill_name}' not found."])
         
     r_exists = conn.execute("MATCH (r:Resource {name: $name}) RETURN count(*)", {"name": resource_name}).get_next()[0]
     if r_exists == 0:
-        return f"Error: Resource '{resource_name}' does not exist. Call 'add_resource' to register."
+        return create_response("grant_skill", "error", warnings=[f"Resource '{resource_name}' not found."])
 
     query = """
     MATCH (r:Resource {name: $resource_name}), (s:Skill {name: $skill_name})
@@ -1258,7 +1418,8 @@ def grant_skill(resource_name: str, skill_name: str, proficiency: str = "Interme
     RETURN h.proficiency
     """
     params = {"resource_name": resource_name, "skill_name": skill_name, "proficiency": proficiency}
-    return safe_cypher_read(query, params)
+    conn.execute(query, params)
+    return create_response("grant_skill", "success", data={"resource": resource_name, "skill": skill_name, "proficiency": proficiency})
 
 @mcp.tool()
 def require_skill(task_name: str, skill_name: str) -> str:
@@ -1267,11 +1428,11 @@ def require_skill(task_name: str, skill_name: str) -> str:
     """
     s_exists = conn.execute("MATCH (s:Skill {name: $name}) RETURN count(*)", {"name": skill_name}).get_next()[0]
     if s_exists == 0:
-        return f"Error: Skill '{skill_name}' does not exist. Call 'add_skill' to register this capability first."
+        return create_response("require_skill", "error", warnings=[f"Skill '{skill_name}' not found."])
         
     t_exists = conn.execute("MATCH (t:Task {name: $name}) RETURN count(*)", {"name": task_name}).get_next()[0]
     if t_exists == 0:
-        return f"Error: Task '{task_name}' does not exist. Call 'add_task' to register."
+        return create_response("require_skill", "error", warnings=[f"Task '{task_name}' not found."])
 
     query = """
     MATCH (t:Task {name: $task_name}), (s:Skill {name: $skill_name})
@@ -1279,7 +1440,8 @@ def require_skill(task_name: str, skill_name: str) -> str:
     RETURN count(r)
     """
     params = {"task_name": task_name, "skill_name": skill_name}
-    return safe_cypher_read(query, params)
+    conn.execute(query, params)
+    return create_response("require_skill", "success", data={"task": task_name, "skill": skill_name})
 
 @mcp.tool()
 def assign_resource(resource_name: str, task_name: str = None, task_names: list = None, allocation: int = 100) -> str:
@@ -1299,11 +1461,19 @@ def assign_resource(resource_name: str, task_name: str = None, task_names: list 
     # Fan-out: handle list form defensively
     if task_name is None and task_names:
         results = []
+        all_warnings = []
         for t in task_names:
-            results.append(assign_resource(resource_name=resource_name, task_name=t, allocation=allocation))
-        return "\n".join(results)
+            # Recursive call returns a JSON string, we parse it to aggregate
+            res_str = assign_resource(resource_name=resource_name, task_name=t, allocation=allocation)
+            res_json = json.loads(res_str)
+            results.append(res_json.get("data", {}))
+            all_warnings.extend(res_json.get("warnings", []))
+        
+        status = "warning" if all_warnings else "success"
+        return create_response("assign_resource", status, data={"resource": resource_name, "assignments": results}, warnings=all_warnings)
+        
     if task_name is None:
-        return "Error: task_name is required."
+        return create_response("assign_resource", "error", warnings=["task_name is required."])
 
     # 1. Gate 1: Strict existence check
     res_node = conn.execute("MATCH (r:Resource {name: $name}) RETURN count(*)", {"name": resource_name})
@@ -1313,9 +1483,9 @@ def assign_resource(resource_name: str, task_name: str = None, task_names: list 
     task_exists = task_node.get_next()[0]
     
     if res_exists == 0:
-        return f"Error: Resource '{resource_name}' does not exist in the database. You MUST call the 'add_resource' tool to create it before attempting this assignment again."
+        return create_response("assign_resource", "error", warnings=[f"Resource '{resource_name}' not found."])
     if task_exists == 0:
-        return f"Error: Task '{task_name}' does not exist. Call 'add_task' first."
+        return create_response("assign_resource", "error", warnings=[f"Task '{task_name}' not found."])
 
     # 2. Execute Assignment
     assign_query = """
@@ -1324,9 +1494,8 @@ def assign_resource(resource_name: str, task_name: str = None, task_names: list 
     SET w.allocation = $allocation
     RETURN w.allocation
     """
-    safe_cypher_read(assign_query, {"r": resource_name, "t": task_name, "allocation": allocation})
+    conn.execute(assign_query, {"r": resource_name, "t": task_name, "allocation": allocation})
     
-    msg = f"Resource '{resource_name}' assigned to '{task_name}' at {allocation}%."
     warnings = []
     
     # 3. State Monitor A: Skill Check
@@ -1346,17 +1515,21 @@ def assign_resource(resource_name: str, task_name: str = None, task_names: list 
             
         missing = required_skills - possessed_skills
         if missing:
-            warnings.append(f"[WARNING: Skill Mismatch] {resource_name} lacks required skills for {task_name}: {', '.join(missing)}.")
+            warnings.append(f"Skill Mismatch: {resource_name} lacks required skills for {task_name}: {', '.join(missing)}.")
             
     # 4. State Monitor B: Over-allocation Check
     over_alloc_msg = _check_over_allocation(resource_name)
     if over_alloc_msg:
         warnings.append(over_alloc_msg)
         
-    # 5. Return
-    if warnings:
-        msg += "\n" + "\n".join(warnings)
-    return msg
+    # 5. Return JSON
+    status = "warning" if warnings else "success"
+    return create_response(
+        operation="assign_resource",
+        status=status,
+        data={"resource": resource_name, "task": task_name, "allocation": allocation},
+        warnings=warnings
+    )
 
 @mcp.tool()
 def check_timeline(project_id: str) -> str:
@@ -1462,9 +1635,17 @@ def auto_level_schedule(project_id: str) -> str:
             break
             
     if not shifts:
-        return "No automated shifts were necessary or possible (all conflicts might be on Critical Path or Locked)."
+        return create_response("auto_level_schedule", "success", data={"project_id": project_id}, warnings=["No automated shifts were necessary or possible."])
     
-    return "Schedule Leveled Successfully:\n" + "\n".join(shifts)
+    return create_response(
+        operation="auto_level_schedule",
+        status="success",
+        data={
+            "project_id": project_id,
+            "shifts_count": len(shifts),
+            "summary": shifts
+        }
+    )
 
 @mcp.tool()
 def get_critical_path(project_id: str) -> str:
@@ -1765,8 +1946,8 @@ def delete_task(task_name: str) -> str:
     _safe_delete_edges("Task", "name", task_name, ["DEPENDS_ON", "WORKS_ON", "REQUIRES_SKILL", "CONTAINS"])
     res = conn.execute("MATCH (t:Task {name: $name}) DELETE t RETURN count(*)", {"name": task_name})
     if res.has_next() and res.get_next()[0] > 0:
-        return f"Task '{task_name}' has been deleted."
-    return f"Error: Task '{task_name}' not found."
+        return create_response("delete_task", "success", data={"task": task_name, "count": 1})
+    return create_response("delete_task", "error", warnings=[f"Task '{task_name}' not found."])
 
 @mcp.tool()
 def delete_resource(resource_name: str) -> str:
@@ -1774,8 +1955,8 @@ def delete_resource(resource_name: str) -> str:
     _safe_delete_edges("Resource", "name", resource_name, ["WORKS_ON", "HAS_SKILL"])
     res = conn.execute("MATCH (r:Resource {name: $name}) DELETE r RETURN count(*)", {"name": resource_name})
     if res.has_next() and res.get_next()[0] > 0:
-        return f"Resource '{resource_name}' has been deleted."
-    return f"Error: Resource '{resource_name}' not found."
+        return create_response("delete_resource", "success", data={"resource": resource_name, "count": 1})
+    return create_response("delete_resource", "error", warnings=[f"Resource '{resource_name}' not found."])
 
 @mcp.tool()
 def delete_skill(skill_name: str) -> str:
@@ -1783,8 +1964,8 @@ def delete_skill(skill_name: str) -> str:
     _safe_delete_edges("Skill", "name", skill_name, ["HAS_SKILL", "REQUIRES_SKILL"])
     res = conn.execute("MATCH (s:Skill {name: $name}) DELETE s RETURN count(*)", {"name": skill_name})
     if res.has_next() and res.get_next()[0] > 0:
-        return f"Skill '{skill_name}' has been deleted."
-    return f"Error: Skill '{skill_name}' not found."
+        return create_response("delete_skill", "success", data={"skill": skill_name, "count": 1})
+    return create_response("delete_skill", "error", warnings=[f"Skill '{skill_name}' not found."])
 
 @mcp.tool()
 def delete_project(project_id: str) -> str:
@@ -1801,8 +1982,8 @@ def delete_project(project_id: str) -> str:
     _safe_delete_edges("Project", "id", project_id, ["CONTAINS"])
     res = conn.execute("MATCH (p:Project {id: $id}) DELETE p RETURN count(*)", {"id": project_id})
     if res.has_next() and res.get_next()[0] > 0:
-        return f"Project '{project_id}' deleted. Cascaded cleanup removed {tasks_deleted} tasks."
-    return f"Error: Project '{project_id}' not found."
+        return create_response("delete_project", "success", data={"project_id": project_id, "tasks_cascaded": tasks_deleted})
+    return create_response("delete_project", "error", warnings=[f"Project '{project_id}' not found."])
 
 
 @mcp.resource("system://info")
@@ -1849,7 +2030,7 @@ def register_custom_report(name: str, description: str, cypher_query: str) -> st
     forbidden_keywords = ["CREATE", "MERGE", "SET", "DELETE", "DROP", "ALTER", "REMOVE"]
     query_upper = cypher_query.upper()
     if any(keyword in query_upper for keyword in forbidden_keywords):
-        return f"Security Violation: Query rejected. Custom reports cannot contain mutating keywords like CREATE or SET."
+        return create_response("register_custom_report", "error", warnings=[f"Security Violation: Custom reports cannot contain mutating keywords ({', '.join(forbidden_keywords)})."])
         
     # 2. Syntax Validation: Try running it with a LIMIT 1 to catch typos instantly
     test_query = f"{cypher_query} LIMIT 1"
@@ -1868,10 +2049,8 @@ def register_custom_report(name: str, description: str, cypher_query: str) -> st
     RETURN r.name
     """
     conn.execute(save_query, {"name": name, "desc": description, "query": cypher_query, "error": last_error})
-    
-    if last_error:
-        return f"Report '{name}' saved, but it contains a syntax error. Use debug_custom_report to view the error log."
-    return f"Success! Custom report '{name}' has been registered and is ready to run."
+    status = "warning" if last_error else "success"
+    return create_response("register_custom_report", status, data={"report_name": name}, warnings=[last_error] if last_error else [])
 
 @mcp.tool()
 def run_custom_report(name: str) -> str:
@@ -1938,6 +2117,207 @@ def list_custom_reports() -> str:
     if count == 0:
         return "No custom reports have been registered yet."
     return table
+
+# ─── Agentic Ergonomics (Phase 17) ──────────────────────────────────────────
+
+@mcp.tool()
+def get_evm_report_tool(project_id: str) -> str:
+    """Generates the Earned Value Management (EVM) report. Returns PV, EV, AC, SPI, and CPI."""
+    return get_evm_report(project_id)
+
+@mcp.tool()
+def get_risk_report_tool(project_id: str) -> str:
+    """Generates the PERT Risk report, ranking tasks by variance."""
+    return get_risk_report(project_id)
+
+@mcp.tool()
+def get_database_schema_tool() -> str:
+    """Returns the database schema (Node labels, properties, and edges). Call this if you are unsure of property names!"""
+    return get_schema()
+
+@mcp.tool()
+def get_project_summary(project_id: str) -> str:
+    """Generates a high-density project summary containing Metrics, Critical Path, and Budget."""
+    return generate_briefing_webhook(project_id)
+
+@mcp.tool()
+def add_tasks_batch(project_id: str, tasks_json: str) -> str:
+    """
+    Creates multiple tasks at once to prevent timeouts.
+    tasks_json MUST be a valid JSON string array of objects: [{"name": "T1", "duration": 5, "cost": 100, "optimistic": 4, "pessimistic": 6}, ...]
+    """
+    import json
+    try:
+        tasks = json.loads(tasks_json)
+    except json.JSONDecodeError:
+        return json.dumps({"status": "error", "message": "tasks_json must be a valid JSON string."})
+          
+    results = []
+    # Explicit Transactional Block
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for t in tasks:
+            # add_task now returns a JSON string
+            res_str = add_task(
+                project_id=project_id, 
+                name=t['name'], 
+                duration=t['duration'], 
+                cost=t['cost'], 
+                description=t.get('description', ''),
+                optimistic=t.get('optimistic', None),
+                pessimistic=t.get('pessimistic', None)
+            )
+            res_json = json.loads(res_str)
+            if res_json.get("status") == "error":
+                raise Exception(f"Task '{t.get('name')}' failed: {res_json.get('warnings')}")
+            results.append(res_json.get("data", {}))
+            
+        conn.execute("COMMIT")
+        return create_response("add_tasks_batch", "success", data={"project_id": project_id, "tasks_created": results})
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        return create_response("add_tasks_batch", "error", warnings=[f"Batch failed and rolled back. Error: {str(e)}"])
+
+@mcp.tool()
+def create_dependencies_batch(dependencies_json: str) -> str:
+    """
+    Creates multiple dependencies at once.
+    dependencies_json MUST be a valid JSON string array: [{"source": "A", "target": "B", "lag": 0}, ...]
+    """
+    import json
+    try:
+        deps = json.loads(dependencies_json)
+    except json.JSONDecodeError:
+        return json.dumps({"status": "error", "message": "dependencies_json must be a valid JSON string."})
+          
+    results = []
+    # Explicit Transactional Block
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for d in deps:
+            res_str = create_dependency(
+                source_name=d['source'], 
+                target_name=d.get('target'), 
+                lag=d.get('lag', 0)
+            )
+            res_json = json.loads(res_str)
+            if res_json.get("status") == "error":
+                raise Exception(f"Dependency {d.get('source')}->{d.get('target')} failed: {res_json.get('warnings')}")
+            results.append(res_json.get("data", {}))
+            
+        conn.execute("COMMIT")
+        return create_response("create_dependencies_batch", "success", data={"dependencies_created": results})
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        return create_response("create_dependencies_batch", "error", warnings=[f"Batch rolled back. Error: {str(e)}"])
+
+@mcp.tool()
+def analyze_root_cause(project_id: str) -> str:
+    """Analyzes the critical path to find the specific tasks causing project delays."""
+    # 1. First get the critical path tasks
+    cp_string = get_critical_path(project_id)
+    if "Project empty" in cp_string: return "Project is empty."
+      
+    cp_tasks = [t.strip() for t in cp_string.replace(f"Critical Path for {project_id}: ", "").split("->")]
+      
+    # 2. Check their baselines
+    report = f"### Root Cause Analysis for {project_id}\n\n"
+    found_slip = False
+      
+    for task in cp_tasks:
+        res = conn.execute("MATCH (t:Task {name: $name}) RETURN t.duration, t.est_date, t.baseline_est_date", {"name": task})
+        if res.has_next():
+            dur, est, b_est = res.get_next()
+            if est and b_est and est > b_est:
+                report += f"- **{task}**: Slipped! Baseline Start was {b_est}, now currently {est}.\n"
+                found_slip = True
+                  
+    if not found_slip:
+        return report + "Critical path is healthy and aligned with baseline."
+    return report
+
+@mcp.tool()
+def simulate_impact(project_id: str, task_name: str, added_duration: int) -> str:
+    """Simulates adding duration to a task to see if the overall project end date changes."""
+    # Get current project end date
+    res_orig = conn.execute("MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task) RETURN max(t.eft_date)", {"pid": project_id})
+    orig_end = res_orig.get_next()[0] if res_orig.has_next() else None
+      
+    # Simulate by temporarily updating, recalculating, capturing, and rolling back
+    conn.execute("MATCH (t:Task {name: $name}) SET t.duration = t.duration + $add", {"name": task_name, "add": int(added_duration)})
+    _recalculate_timeline(project_id)
+      
+    res_new = conn.execute("MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task) RETURN max(t.eft_date)", {"pid": project_id})
+    new_end = res_new.get_next()[0] if res_new.has_next() else None
+      
+    # Rollback
+    conn.execute("MATCH (t:Task {name: $name}) SET t.duration = t.duration - $add", {"name": task_name, "add": int(added_duration)})
+    _recalculate_timeline(project_id)
+      
+    if orig_end == new_end:
+        return f"Safe. Adding {added_duration} days to {task_name} consumes Float but does NOT delay the project (End date remains {orig_end})."
+    else:
+        return f"CRITICAL IMPACT: Adding {added_duration} days to {task_name} pushes the project end date from {orig_end} to {new_end}."
+
+@mcp.resource("project://{project_id}/state/export/gantt")
+def export_gantt_chart(project_id: str):
+    """Generates a visual Gantt chart PNG of the project timeline."""
+    query = """
+    MATCH (p:Project {id: $pid})-[:CONTAINS]->(t:Task)
+    RETURN t.name, t.est_date, t.eft_date
+    ORDER BY t.est_date DESC
+    """
+    res = conn.execute(query, {"pid": project_id})
+      
+    tasks = []
+    starts = []
+    ends = []
+      
+    while res.has_next():
+        row = res.get_next()
+        if row[1] and row[2]:
+            tasks.append(row[0])
+            starts.append(np.datetime64(row[1]))
+            ends.append(np.datetime64(row[2]))
+              
+    if not tasks: return {"type": "text", "text": "No valid tasks found."}
+      
+    fig, ax = plt.subplots(figsize=(10, len(tasks) * 0.5 + 2))
+      
+    # Convert numpy dates to matplotlib dates
+    start_dates = [mdates.date2num(d.astype(datetime.date)) for d in starts]
+    end_dates = [mdates.date2num(d.astype(datetime.date)) for d in ends]
+    durations = [e - s for s, e in zip(start_dates, end_dates)]
+      
+    ax.barh(tasks, durations, left=start_dates, color='skyblue', edgecolor='black')
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.xticks(rotation=45)
+    plt.title(f"Gantt Chart: {project_id}")
+    plt.tight_layout()
+      
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    base64_data = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close(fig)
+      
+    return {"type": "image", "data": base64_data, "mimeType": "image/png"}
+
+@mcp.tool()
+def generate_human_decision_prompt(task_name: str, conflict_description: str) -> str:
+    """Formats an escalation prompt for the human operator when the AI cannot resolve a conflict safely."""
+    prompt = f"🚨 **HUMAN ESCALATION REQUIRED** 🚨\n\n"
+    prompt += f"**Issue on Task:** `{task_name}`\n"
+    prompt += f"**Conflict:** {conflict_description}\n\n"
+    prompt += "The Auto-Leveler cannot resolve this without impacting the baseline. Please choose an intervention:\n\n"
+    prompt += "- [ ] **Option A: Increase Budget** (Authorize overtime or assign additional resources to crash the schedule).\n"
+    prompt += "- [ ] **Option B: Accept Delay** (Allow the Critical Path to push back the project end date).\n"
+    prompt += "- [ ] **Option C: Cut Scope** (Reduce the duration of this task or a downstream task to regain time).\n\n"
+    prompt += "*Reply with your choice and I will execute the necessary graph changes.*"
+    return prompt
+
+
 
 
 if __name__ == "__main__":

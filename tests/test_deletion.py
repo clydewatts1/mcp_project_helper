@@ -1,5 +1,6 @@
 import pytest
 import kuzu
+import json
 
 def test_delete_task_severs_dependencies(isolated_server):
     s = isolated_server
@@ -54,8 +55,9 @@ def test_delete_project_cascades(isolated_server):
     assert res.get_next()[0] == 2
     
     # Delete Project
-    result_msg = s.delete_project("P_DELETE")
-    assert "removed 2 tasks" in result_msg
+    result_json = s.delete_project("P_DELETE")
+    data = json.loads(result_json)
+    assert data["data"]["tasks_cascaded"] == 2
     
     # Verify everything is gone
     res = s.conn.execute("MATCH (p:Project {id: 'P_DELETE'}) RETURN count(*)")
