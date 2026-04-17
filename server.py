@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import base64
@@ -8,11 +9,35 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import io
 import kuzu
+import sys
 from collections import deque
 from mcp.server.fastmcp import FastMCP
 
+# Resolve absolute path for database
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Set to "" for in-memory mode, or an absolute path for persistent storage
+DEFAULT_DB_PATH = os.getenv("KUZU_DB_PATH", "")
+
 # Initialize FastMCP
 mcp = FastMCP("ProjectLogicEngine")
+
+@mcp.tool()
+def export_project_image_tool(project_id: str) -> str:
+    """
+    Generates a Base64 PNG of the Graphviz network diagram. 
+    Call this to visually export and view the project state.
+    """
+    try:
+        result = get_project_graph(project_id) # Call your existing function
+        if isinstance(result, dict) and "data" in result:
+            return create_response(
+                operation="export_project_image", 
+                status="success", 
+                data={"image_base64": result["data"], "format": "png"}
+            )
+        return create_response("export_project_image", "error", warnings=[str(result)])
+    except Exception as e:
+        return create_response("export_project_image", "error", warnings=[f"Failed to generate image: {str(e)}"])
 
 def create_response(operation: str, status: str, data: dict = None, warnings: list = None) -> str:
     """
@@ -29,19 +54,46 @@ def create_response(operation: str, status: str, data: dict = None, warnings: li
     }
     return json.dumps(response, indent=2)
 
-# Initialize Kuzu Database (Phase 1 Step 1)
-db = kuzu.Database('./project_data.kuzu')
-conn = kuzu.Connection(db)
+# Database State (Lazy Init)
+db = None
+conn = None
+
+def get_db_connection():
+    """Lazily initializes and returns the database connection."""
+    global db, conn
+    if db is None:
+        db_path = DEFAULT_DB_PATH
+        import time as _time
+        max_retries = 5
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                db = kuzu.Database(db_path)
+                conn = kuzu.Connection(db)
+                break
+            except Exception as e:
+                if "Could not set lock on file" in str(e) and attempt < max_retries - 1:
+                    print(f"DATABASE LOCKED (Attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...", file=sys.stderr)
+                    _time.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+                # Print to stderr to avoid breaking MCP JSON-RPC protocol
+                print(f"FAILED TO INIT KUZU AT {db_path}: {e}", file=sys.stderr)
+                raise
+    return db, conn
 
 def initialize_schema():
     """Initializes the database schema with Project, Task, and Relationship tables."""
+    _, conn = get_db_connection()
     # Node Tables
     node_queries = [
         "CREATE NODE TABLE Project (id STRING, start_date STRING, name STRING, PRIMARY KEY (id))",
         "CREATE NODE TABLE Task (name STRING, description STRING, duration INT, optimistic_duration INT, pessimistic_duration INT, expected_duration DOUBLE, cost DOUBLE, actual_cost DOUBLE, est_date STRING, eft_date STRING, status STRING, baseline_est_date STRING, baseline_eft_date STRING, baseline_cost DOUBLE, percent_complete INT, total_float INT, leveling_delay INT, PRIMARY KEY (name))",
         "CREATE NODE TABLE Resource (name STRING, description STRING, type STRING, cost_rate DOUBLE, PRIMARY KEY (name))",
         "CREATE NODE TABLE Skill (name STRING, description STRING, PRIMARY KEY (name))",
-        "CREATE NODE TABLE CustomReport (name STRING, description STRING, cypher_query STRING, last_error STRING, PRIMARY KEY (name))"
+        "CREATE NODE TABLE CustomReport (name STRING, description STRING, cypher_query STRING, last_error STRING, PRIMARY KEY (name))",
+        "CREATE NODE TABLE Holiday (date STRING, description STRING, PRIMARY KEY (date))"
     ]
     
     # Edge Tables
@@ -91,8 +143,7 @@ def initialize_schema():
     except Exception:
         pass
 
-# Run schema initialization on startup
-initialize_schema()
+# Note: initialize_schema() is now called in the __main__ block to prevent accidental DB locking on import.
 
 def safe_cypher_read(query: str, params: dict = None) -> str:
     """
@@ -149,6 +200,13 @@ def _recalculate_timeline(project_id: str, repro_set=None):
     if not proj_res.has_next():
         return []
     project_start_date = proj_res.get_next()[0]
+    
+    # 1.1 Fetch Global Holidays
+    hol_res = conn.execute("MATCH (h:Holiday) RETURN h.date")
+    holidays = []
+    while hol_res.has_next():
+        holidays.append(np.datetime64(hol_res.get_next()[0]))
+    holidays = np.array(holidays, dtype='datetime64[D]')
 
     # 2. Fetch all tasks in project
     task_res = conn.execute("""
@@ -216,7 +274,7 @@ def _recalculate_timeline(project_id: str, repro_set=None):
     
     for name in sorted_tasks:
         task = tasks[name]
-        candidate_dates = [np.busday_offset(project_start_date, 0, roll='following')]
+        candidate_dates = [np.busday_offset(project_start_date, 0, roll='following', holidays=holidays)]
         
         for pred in task["predecessors"]:
             if "external_eft" in pred:
@@ -229,14 +287,14 @@ def _recalculate_timeline(project_id: str, repro_set=None):
                 # Use calculated date from this pass
                 ref_eft = task_dates[pred["source"]]["eft"]
             
-            start_candidate = np.busday_offset(ref_eft, 1 + pred["lag"], roll='following')
+            start_candidate = np.busday_offset(ref_eft, 1 + pred["lag"], roll='following', holidays=holidays)
             candidate_dates.append(start_candidate)
             
         proposed_est = max(candidate_dates)
         
         # Apply leveling_delay (Defect 1 fix)
         if task["delay"] > 0:
-            proposed_est = np.busday_offset(proposed_est, task["delay"], roll='following')
+            proposed_est = np.busday_offset(proposed_est, task["delay"], roll='following', holidays=holidays)
         
         if task["status"] == "HUMAN_LOCKED" and task["est"]:
             actual_est = np.datetime64(task["est"])
@@ -244,7 +302,7 @@ def _recalculate_timeline(project_id: str, repro_set=None):
                 critical_conflicts.append(f"[CRITICAL CONFLICT] Task '{name}' is locked at {task['est']} but dependencies push it to {proposed_est}")
             task_dates[name] = {"est": task["est"], "eft": task["eft"], "locked": True}
         else:
-            eft = np.busday_offset(proposed_est, task["duration"] - 1, roll='following')
+            eft = np.busday_offset(proposed_est, task["duration"] - 1, roll='following', holidays=holidays)
             task_dates[name] = {"est": str(proposed_est), "eft": str(eft), "locked": False}
 
     # 6. Update Database
@@ -257,13 +315,17 @@ def _recalculate_timeline(project_id: str, repro_set=None):
             
     # 7. Cascading Trigger: Identify successor projects and recalculate them
     # Project B's dates might need to change if Project A moved.
+    successor_pids = []
     successor_projects_res = conn.execute("""
         MATCH (p_s:Project {id: $id})-[:CONTAINS]->(s:Task)-[:DEPENDS_ON]->(t:Task)<-[:CONTAINS]-(p_t:Project)
         WHERE p_s.id <> p_t.id
         RETURN DISTINCT p_t.id
     """, {"id": project_id})
+    
     while successor_projects_res.has_next():
-        target_pid = successor_projects_res.get_next()[0]
+        successor_pids.append(successor_projects_res.get_next()[0])
+    
+    for target_pid in successor_pids:
         critical_conflicts += _recalculate_timeline(target_pid, repro_set)
             
     return critical_conflicts
@@ -385,7 +447,7 @@ def baseline_project(project_id: str) -> str:
     return create_response("baseline_project", "error", warnings=[f"Project '{project_id}' not found."])
 
 @mcp.tool()
-def set_task_progress(task_name: str, percent_complete: int) -> str:
+def set_task_progress(task_name: str, percent_complete: int, skip_recalc: bool = False) -> str:
     """Updates completion percentage (0-100) and automatically transitions the status."""
     if not (0 <= percent_complete <= 100): 
         return create_response("set_task_progress", "error", warnings=["percent_complete must be 0-100."])
@@ -495,11 +557,11 @@ def update_task_actual_cost(task_name: str, actual_cost: float) -> str:
         return create_response("update_task_actual_cost", "success", data={"task": task_name, "actual_cost": actual_cost})
     return create_response("update_task_actual_cost", "error", warnings=[f"Task '{task_name}' not found."])
 
-@mcp.resource("project://{project_id}/reports/evm")
-def get_evm_report(project_id: str) -> str:
+def get_evm_report_internal(project_id: str, as_of_date: str = None) -> str:
     """
     Generates an Earned Value Management (EVM) report.
     Calculates PV, EV, AC, SPI, and CPI.
+    Use as_of_date (YYYY-MM-DD) to calculate Planned Value relative to a future/past date.
     """
     # 1. Fetch data
     query = """
@@ -512,7 +574,11 @@ def get_evm_report(project_id: str) -> str:
     total_pv = 0.0
     total_ev = 0.0
     total_ac = 0.0
-    today = np.datetime64(datetime.date.today())
+    
+    if as_of_date:
+        today = np.datetime64(as_of_date)
+    else:
+        today = np.datetime64(datetime.date.today())
     
     tasks_stats = []
     
@@ -751,21 +817,26 @@ def get_portfolio_allocation_report() -> str:
         active_tasks = set()
         conflict_windows = []
         
-        for i in range(len(events)):
-            date, priority, delta, task_label, event_type = events[i]
-            current_alloc += delta
-            if event_type == "START": active_tasks.add(task_label)
-            else: active_tasks.discard(task_label)
+        i = 0
+        while i < len(events):
+            current_date = events[i][0]
+            # Process all events for the current date
+            while i < len(events) and events[i][0] == current_date:
+                date, priority, delta, task_label, event_type = events[i]
+                current_alloc += delta
+                if event_type == "START": active_tasks.add(task_label)
+                else: active_tasks.discard(task_label)
+                i += 1
             
             if current_alloc > 100:
-                if i + 1 < len(events):
-                    next_date = events[i+1][0]
-                    if next_date != date:
-                        conflict_windows.append({
-                            "window": f"{date} to {next_date}",
-                            "total": current_alloc,
-                            "tasks": list(active_tasks)
-                        })
+                # Find the next date in events or use "End of Project"
+                next_date = events[i][0] if i < len(events) else "Project End"
+                if next_date != current_date:
+                    conflict_windows.append({
+                        "window": f"{current_date} to {next_date}",
+                        "total": current_alloc,
+                        "tasks": list(active_tasks)
+                    })
         
         if conflict_windows:
             conflicts_found = True
@@ -792,6 +863,7 @@ def _check_over_allocation(resource_name: str) -> str:
             row = res.get_next()
             if row[0] and row[1]: # Only process if dates are set
                 intervals.append(row)
+        
             
         if not intervals:
             return ""
@@ -816,13 +888,20 @@ def _check_over_allocation(resource_name: str) -> str:
             
         # Sort events by date
         events.sort()
+        # print(f"DEBUG Resource {resource_name} events: {events}")
         
+        # Process events by date
         current_alloc = 0
         max_alloc = 0
         
-        for i in range(len(events)):
-            _, priority, delta = events[i]
-            current_alloc += delta
+        i = 0
+        while i < len(events):
+            current_date = events[i][0]
+            # Process all events for the current date before checking max_alloc
+            while i < len(events) and events[i][0] == current_date:
+                current_alloc += events[i][2]
+                i += 1
+            # Check after processing all events for this date
             if current_alloc > 100:
                 max_alloc = max(max_alloc, current_alloc)
                 
@@ -1017,7 +1096,7 @@ def create_project(project_id: str, start_date: str, name: str) -> str:
     return create_response("create_project", "success", data={"project_id": project_id, "name": name, "start_date": start_date})
 
 @mcp.tool()
-def add_task(project_id: str, name: str, duration, cost, description: str = "", optimistic: int = None, pessimistic: int = None) -> str:
+def add_task(project_id: str, name: str, duration, cost, description: str = "", optimistic: int = None, pessimistic: int = None, skip_recalc: bool = False) -> str:
     """
     Adds a task to a project and initializes its dates and PERT estimates.
     """
@@ -1064,8 +1143,12 @@ def add_task(project_id: str, name: str, duration, cost, description: str = "", 
     if not res.has_next():
          return create_response("add_task", "error", warnings=[f"Project '{project_id}' not found. Create project first."])
          
-    conflicts = _recalculate_timeline(project_id)
-    status = "warning" if conflicts else "success"
+    if not skip_recalc:
+        conflicts = _recalculate_timeline(project_id)
+        status = "warning" if conflicts else "success"
+    else:
+        conflicts = []
+        status = "success"
     
     return create_response(
         operation="add_task",
@@ -1075,7 +1158,7 @@ def add_task(project_id: str, name: str, duration, cost, description: str = "", 
     )
 
 @mcp.tool()
-def create_dependency(source_name: str, target_name: str = None, target_names: list = None, lag: int = 0) -> str:
+def create_dependency(source_name: str, target_name: str = None, target_names: list = None, lag: int = 0, skip_recalc: bool = False) -> str:
     """
     Creates a dependency between two tasks. 
     CRITICAL: You MUST ensure BOTH tasks exist before calling this.
@@ -1088,7 +1171,7 @@ def create_dependency(source_name: str, target_name: str = None, target_names: l
         results = []
         all_warnings = []
         for t in target_names:
-            res_str = create_dependency(source_name=source_name, target_name=t, lag=lag)
+            res_str = create_dependency(source_name=source_name, target_name=t, lag=lag, skip_recalc=skip_recalc)
             res_json = json.loads(res_str)
             if res_json.get("status") == "error":
                 return res_str # Bubble up hard errors during fan-out
@@ -1130,10 +1213,11 @@ def create_dependency(source_name: str, target_name: str = None, target_names: l
     except Exception as e:
          return create_response("create_dependency", "error", warnings=[f"Kuzu Error in cycle check: {str(e)}"])
 
-    # Gate 2: Create Edge
+    # Gate 2: Create Edge (Idempotent MERGE + SET pattern)
     query = """
     MATCH (a:Task {name: $source_name}), (b:Task {name: $target_name})
-    MERGE (a)-[r:DEPENDS_ON {lag: $lag}]->(b)
+    MERGE (a)-[r:DEPENDS_ON]->(b)
+    SET r.lag = $lag
     RETURN count(r)
     """
     conn.execute(query, {"source_name": source_name, "target_name": target_name, "lag": lag})
@@ -1142,7 +1226,7 @@ def create_dependency(source_name: str, target_name: str = None, target_names: l
     proj_query = "MATCH (p:Project)-[:CONTAINS]->(t:Task {name: $name}) RETURN p.id"
     proj_res = conn.execute(proj_query, {"name": source_name})
     conflicts = []
-    if proj_res.has_next():
+    if not skip_recalc and proj_res.has_next():
         project_id = proj_res.get_next()[0]
         conflicts = _recalculate_timeline(project_id)
               
@@ -1279,7 +1363,8 @@ def clone_scenario(source_project_id: str, new_scenario_id: str) -> str:
     MATCH (p:Project {id: $src})-[:CONTAINS]->(s:Task)-[r:DEPENDS_ON]->(t:Task)
     MATCH (new_s:Task {name: $dest + '_' + s.name})
     MATCH (new_t:Task {name: $dest + '_' + t.name})
-    MERGE (new_s)-[:DEPENDS_ON {lag: r.lag}]->(new_t)
+    MERGE (new_s)-[new_r:DEPENDS_ON]->(new_t)
+    SET new_r.lag = r.lag
     """
     conn.execute(query_deps, {"src": source_project_id, "dest": new_scenario_id})
       
@@ -1287,7 +1372,8 @@ def clone_scenario(source_project_id: str, new_scenario_id: str) -> str:
     query_works = """
     MATCH (p:Project {id: $src})-[:CONTAINS]->(t:Task)<-[w:WORKS_ON]-(r:Resource)
     MATCH (new_t:Task {name: $dest + '_' + t.name})
-    MERGE (r)-[:WORKS_ON {allocation: w.allocation}]->(new_t)
+    MERGE (r)-[new_w:WORKS_ON]->(new_t)
+    SET new_w.allocation = w.allocation
     """
     conn.execute(query_works, {"src": source_project_id, "dest": new_scenario_id})
 
@@ -1329,7 +1415,7 @@ def generate_briefing_webhook(project_id: str) -> str:
     Combines Critical Path, Budget, and EVM data.
     """
     cp = get_critical_path(project_id)
-    evm = get_evm_report(project_id)
+    evm = get_evm_report_internal(project_id)
     budget = get_budget_report(project_id)
     
     # Condensed version
@@ -1428,7 +1514,8 @@ def grant_skill(resource_name: str, skill_name: str, proficiency: str = "Interme
 
     query = """
     MATCH (r:Resource {name: $resource_name}), (s:Skill {name: $skill_name})
-    MERGE (r)-[h:HAS_SKILL {proficiency: $proficiency}]->(s)
+    MERGE (r)-[h:HAS_SKILL]->(s)
+    SET h.proficiency = $proficiency
     RETURN h.proficiency
     """
     params = {"resource_name": resource_name, "skill_name": skill_name, "proficiency": proficiency}
@@ -1514,7 +1601,7 @@ def assign_resource(resource_name: str, task_name: str = None, task_names: list 
     
     # 3. State Monitor A: Skill Check
     req_query = "MATCH (t:Task {name: $t})-[:REQUIRES_SKILL]->(s:Skill) RETURN s.name"
-    has_query = "MATCH (r:Resource {name: $r})-[:HAS_SKILL]->(s:Skill) RETURN s.name"
+    has_query = "MATCH (r:Resource {name: $r})-[h:HAS_SKILL]->(s:Skill) RETURN s.name, h.proficiency"
     
     required_it = conn.execute(req_query, {"t": task_name})
     required_skills = set()
@@ -1523,13 +1610,24 @@ def assign_resource(resource_name: str, task_name: str = None, task_names: list 
         
     if required_skills:
         possessed_it = conn.execute(has_query, {"r": resource_name})
-        possessed_skills = set()
+        possessed_skills = {} # name -> proficiency
         while possessed_it.has_next():
-            possessed_skills.add(possessed_it.get_next()[0])
+            row = possessed_it.get_next()
+            possessed_skills[row[0]] = row[1]
             
-        missing = required_skills - possessed_skills
+        missing = required_skills - set(possessed_skills.keys())
         if missing:
             warnings.append(f"Skill Mismatch: {resource_name} lacks required skills for {task_name}: {', '.join(missing)}.")
+        else:
+            # Check proficiency levels (Defaulting requirement to Intermediate)
+            rank = {"Beginner": 1, "Intermediate": 2, "Expert": 3}
+            for skill in required_skills:
+                p_level = possessed_skills.get(skill, "Beginner")
+                if rank.get(p_level, 0) < rank["Intermediate"]:
+                    warnings.append(f"Proficiency Warning: {resource_name} is only '{p_level}' in {skill} (Task recommends at least Intermediate).")
+                else:
+                    # Optional: Info about proficiency
+                    pass
             
     # 4. State Monitor B: Over-allocation Check
     over_alloc_msg = _check_over_allocation(resource_name)
@@ -1544,6 +1642,22 @@ def assign_resource(resource_name: str, task_name: str = None, task_names: list 
         data={"resource": resource_name, "task": task_name, "allocation": allocation},
         warnings=warnings
     )
+
+@mcp.tool()
+def unassign_resource(resource_name: str, task_name: str) -> str:
+    """Removes a resource assignment from a task."""
+    query = """
+    MATCH (r:Resource {name: $r_name})-[w:WORKS_ON]->(t:Task {name: $t_name})
+    DELETE w
+    RETURN count(w)
+    """
+    try:
+        res = conn.execute(query, {"r_name": resource_name, "t_name": task_name})
+        if res.has_next() and res.get_next()[0] > 0:
+            return create_response("unassign_resource", "success", data={"resource": resource_name, "task": task_name})
+        return create_response("unassign_resource", "warning", warnings=["Assignment not found."])
+    except Exception as e:
+        return create_response("unassign_resource", "error", warnings=[str(e)])
 
 @mcp.tool()
 def check_timeline(project_id: str) -> str:
@@ -1610,14 +1724,18 @@ def auto_level_schedule(project_id: str) -> str:
             current_alloc = 0
             active_tasks = {} # name -> {status, float, pid}
             
-            for i in range(len(events)):
-                date, priority, delta, t_name, ev_type, status, t_float, t_pid = events[i]
-                current_alloc += delta
-                if ev_type == "START": active_tasks[t_name] = {"status": status, "float": t_float, "pid": t_pid}
-                else: active_tasks.pop(t_name, None)
+            i = 0
+            while i < len(events):
+                current_date = events[i][0]
+                while i < len(events) and events[i][0] == current_date:
+                    date, priority, delta, t_name, ev_type, status, t_float, t_pid = events[i]
+                    current_alloc += delta
+                    if ev_type == "START": active_tasks[t_name] = {"status": status, "float": t_float, "pid": t_pid}
+                    else: active_tasks.pop(t_name, None)
+                    i += 1
                 
                 if current_alloc > 100:
-                    # Conflict at 'date'!
+                    # Conflict at 'current_date'!
                     # Heuristic: Pick task with highest float that isn't locked or float=0
                     # IMPORTANT: We only shift tasks in the CURRENT project_id 
                     # to keep the solver focused, but we see conflicts from other projects.
@@ -1984,20 +2102,140 @@ def delete_skill(skill_name: str) -> str:
 @mcp.tool()
 def delete_project(project_id: str) -> str:
     """Deletes a project and all its contained tasks (cascading)."""
-    # 1. Fetch all tasks in project
-    task_res = conn.execute("MATCH (p:Project {id: $id})-[:CONTAINS]->(t:Task) RETURN t.name", {"id": project_id})
-    tasks_deleted = 0
-    while task_res.has_next():
-        t_name = task_res.get_next()[0]
-        delete_task(t_name)
-        tasks_deleted += 1
+    # 1. Bulk sever ALL incident edges (directed both ways) for tasks in this project 
+    # This prevents orphaned edges from re-attaching to future tasks with same names.
+    # Bug 1 Fix: Explicitly delete DEPENDS_ON edges before other incident edges to be super safe.
+    conn.execute("MATCH (a:Task {project_id: $id})-[r:DEPENDS_ON]->() DELETE r", {"id": project_id})
+    conn.execute("MATCH (a:Task {project_id: $id})<-[r:DEPENDS_ON]-() DELETE r", {"id": project_id})
+    # General detachment
+    conn.execute("MATCH (t:Task {project_id: $id})-[r]->() DELETE r", {"id": project_id})
+    conn.execute("MATCH (t:Task {project_id: $id})<-[r]-() DELETE r", {"id": project_id})
     
-    # 2. Sever project's own edges and delete
+    # 2. Bulk delete the tasks themselves
+    res_tasks = conn.execute("MATCH (t:Task {project_id: $id}) DELETE t RETURN count(*)", {"id": project_id})
+    tasks_deleted = res_tasks.get_next()[0] if res_tasks.has_next() else 0
+
+    # 3. Sever project's own edges and delete
     _safe_delete_edges("Project", "id", project_id, ["CONTAINS"])
     res = conn.execute("MATCH (p:Project {id: $id}) DELETE p RETURN count(*)", {"id": project_id})
     if res.has_next() and res.get_next()[0] > 0:
         return create_response("delete_project", "success", data={"project_id": project_id, "tasks_cascaded": tasks_deleted})
     return create_response("delete_project", "error", warnings=[f"Project '{project_id}' not found."])
+
+
+@mcp.tool()
+def add_holiday(date: str, description: str = "") -> str:
+    """Adds a global holiday (YYYY-MM-DD) that the scheduler respects."""
+    try:
+        np.datetime64(date)
+    except Exception:
+        return create_response("add_holiday", "error", warnings=["Invalid date format. Use YYYY-MM-DD."])
+    
+    db, conn = get_db_connection()
+    conn.execute("MERGE (h:Holiday {date: $date})", {"date": date})
+    conn.execute("MATCH (h:Holiday {date: $date}) SET h.description = $holiday_desc", {"date": date, "holiday_desc": description})
+    return create_response("add_holiday", "success", data={"date": date, "description": description})
+
+@mcp.tool()
+def remove_holiday(date: str) -> str:
+    """Removes a global holiday."""
+    db, conn = get_db_connection()
+    res = conn.execute("MATCH (h:Holiday {date: $date}) DELETE h RETURN count(*)", {"date": date})
+    if res.has_next() and res.get_next()[0] > 0:
+        return create_response("remove_holiday", "success", data={"date": date})
+    return create_response("remove_holiday", "error", warnings=[f"Holiday '{date}' not found."])
+
+@mcp.tool()
+def get_holidays() -> str:
+    """Returns all registered global holidays."""
+    db, conn = get_db_connection()
+    res = conn.execute("MATCH (h:Holiday) RETURN h.date, h.description ORDER BY h.date")
+    hols = []
+    while res.has_next():
+        date, desc = res.get_next()
+        hols.append({"date": date, "description": desc})
+    return create_response("get_holidays", "success", data={"holidays": hols})
+
+@mcp.tool()
+def export_to_gantt(project_id: str) -> str:
+    """Exports a Mermaid Gantt chart of the project, grouped by task status."""
+    db, conn = get_db_connection()
+    proj_res = conn.execute("MATCH (p:Project {id: $id}) RETURN p.name", {"id": project_id})
+    if not proj_res.has_next():
+        return create_response("export_to_gantt", "error", warnings=[f"Project '{project_id}' not found."])
+    project_name = proj_res.get_next()[0]
+
+    # Fetch tasks grouped by status
+    # We'll use status as sections
+    task_res = conn.execute("""
+        MATCH (p:Project {id: $id})-[:CONTAINS]->(t:Task)
+        RETURN t.name, t.est_date, t.eft_date, t.status
+        ORDER BY t.status, t.est_date
+    """, {"id": project_id})
+    
+    gantt = "gantt\n"
+    gantt += f"    title {project_name}\n"
+    gantt += "    dateFormat YYYY-MM-DD\n"
+    gantt += "    axisFormat %m-%d\n\n"
+    
+    current_status = None
+    while task_res.has_next():
+        name, est, eft, status = task_res.get_next()
+        if status != current_status:
+            current_status = status
+            gantt += f"    section {status}\n"
+        
+        # Format task line for Mermaid
+        # [Name] :[ID], [Start], [End]
+        # Mermaid needs dates in dateFormat.
+        clean_name = name.replace(":", " ") # Escape colons
+        gantt += f"    {clean_name} :{est}, {eft}\n"
+        
+    return create_response("export_to_gantt", "success", data={"mermaid": gantt})
+
+@mcp.tool()
+def batch_assign_resources(assignments: list[dict]) -> str:
+    """
+    Assigns multiple resources to tasks in one transaction.
+    assignments: [{"resource_name": "Alice", "task_name": "T1", "allocation": 100}, ...]
+    """
+    db, conn = get_db_connection()
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        results = []
+        for x in assignments:
+            res_str = assign_resource(x['resource_name'], x['task_name'], x.get('allocation', 100))
+            res_json = json.loads(res_str)
+            if res_json.get("status") == "error":
+                raise Exception(f"Assignment failed for {x}: {res_json.get('warnings')}")
+            results.append(x)
+        conn.execute("COMMIT")
+        return create_response("batch_assign_resources", "success", data={"assignments": results})
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        return create_response("batch_assign_resources", "error", warnings=[str(e)])
+
+@mcp.tool()
+def batch_grant_skills(grants: list[dict]) -> str:
+    """
+    Grants multiple skills to resources in one transaction.
+    grants: [{"resource_name": "Alice", "skill_name": "Python", "proficiency": "Expert"}, ...]
+    """
+    db, conn = get_db_connection()
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        results = []
+        for g in grants:
+            res_str = grant_skill(g['resource_name'], g['skill_name'], g.get('proficiency', 'Intermediate'))
+            res_json = json.loads(res_str)
+            if res_json.get("status") == "error":
+                raise Exception(f"Skill grant failed for {g}: {res_json.get('warnings')}")
+            results.append(g)
+        conn.execute("COMMIT")
+        return create_response("batch_grant_skills", "success", data={"grants": results})
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        return create_response("batch_grant_skills", "error", warnings=[str(e)])
 
 
 @mcp.resource("system://info")
@@ -2135,9 +2373,20 @@ def list_custom_reports() -> str:
 # ─── Agentic Ergonomics (Phase 17) ──────────────────────────────────────────
 
 @mcp.tool()
-def get_evm_report_tool(project_id: str) -> str:
-    """Generates the Earned Value Management (EVM) report. Returns PV, EV, AC, SPI, and CPI."""
-    return get_evm_report(project_id)
+def get_evm_report_tool(project_id: str, as_of_date: str = None) -> str:
+    """
+    Generates the Earned Value Management (EVM) report. 
+    Use as_of_date (YYYY-MM-DD) to calculate Planned Value relative to a future/past date.
+    Returns PV, EV, AC, SPI, and CPI.
+    """
+    return get_evm_report_internal(project_id, as_of_date)
+
+@mcp.resource("project://{project_id}/reports/evm")
+def get_evm_report_resource(project_id: str) -> str:
+    """
+    Generates the static EVM report for the current date.
+    """
+    return get_evm_report_internal(project_id)
 
 @mcp.tool()
 def get_risk_report_tool(project_id: str) -> str:
@@ -2155,17 +2404,11 @@ def get_project_summary(project_id: str) -> str:
     return generate_briefing_webhook(project_id)
 
 @mcp.tool()
-def add_tasks_batch(project_id: str, tasks_json: str) -> str:
+def add_tasks_batch(project_id: str, tasks: list[dict]) -> str:
     """
-    Creates multiple tasks at once to prevent timeouts.
-    tasks_json MUST be a valid JSON string array of objects: [{"name": "T1", "duration": 5, "cost": 100, "optimistic": 4, "pessimistic": 6}, ...]
+    Creates multiple tasks at once.
+    tasks: [{"name": "T1", "duration": 5, "cost": 100, "optimistic": 4, "pessimistic": 6}, ...]
     """
-    import json
-    try:
-        tasks = json.loads(tasks_json)
-    except json.JSONDecodeError:
-        return json.dumps({"status": "error", "message": "tasks_json must be a valid JSON string."})
-          
     results = []
     # Explicit Transactional Block
     conn.execute("BEGIN TRANSACTION")
@@ -2179,51 +2422,85 @@ def add_tasks_batch(project_id: str, tasks_json: str) -> str:
                 cost=t['cost'], 
                 description=t.get('description', ''),
                 optimistic=t.get('optimistic', None),
-                pessimistic=t.get('pessimistic', None)
+                pessimistic=t.get('pessimistic', None),
+                skip_recalc=True
             )
             res_json = json.loads(res_str)
             if res_json.get("status") == "error":
                 raise Exception(f"Task '{t.get('name')}' failed: {res_json.get('warnings')}")
             results.append(res_json.get("data", {}))
             
+        # Single recalculation at the end
+        warnings = _recalculate_timeline(project_id)
         conn.execute("COMMIT")
-        return create_response("add_tasks_batch", "success", data={"project_id": project_id, "tasks_created": results})
+        return create_response("add_tasks_batch", "success", data={"project_id": project_id, "tasks_created": results}, warnings=warnings)
     except Exception as e:
         conn.execute("ROLLBACK")
         return create_response("add_tasks_batch", "error", warnings=[f"Batch failed and rolled back. Error: {str(e)}"])
 
 @mcp.tool()
-def create_dependencies_batch(dependencies_json: str) -> str:
+def create_dependencies_batch(dependencies: list[dict]) -> str:
     """
     Creates multiple dependencies at once.
-    dependencies_json MUST be a valid JSON string array: [{"source": "A", "target": "B", "lag": 0}, ...]
+    dependencies: [{"source": "A", "target": "B", "lag": 0}, ...]
     """
-    import json
-    try:
-        deps = json.loads(dependencies_json)
-    except json.JSONDecodeError:
-        return json.dumps({"status": "error", "message": "dependencies_json must be a valid JSON string."})
-          
     results = []
     # Explicit Transactional Block
     conn.execute("BEGIN TRANSACTION")
     try:
-        for d in deps:
+        for d in dependencies:
             res_str = create_dependency(
                 source_name=d['source'], 
                 target_name=d.get('target'), 
-                lag=d.get('lag', 0)
+                lag=d.get('lag', 0),
+                skip_recalc=True
             )
             res_json = json.loads(res_str)
             if res_json.get("status") == "error":
                 raise Exception(f"Dependency {d.get('source')}->{d.get('target')} failed: {res_json.get('warnings')}")
             results.append(res_json.get("data", {}))
             
+        # Single recalculation at the end (for all affected projects)
+        all_warnings = []
+        affected_projects = set()
+        for d in dependencies:
+             # Find project for each source task
+             p_res = conn.execute("MATCH (p:Project)-[:CONTAINS]->(t:Task {name: $name}) RETURN p.id", {"name": d['source']})
+             if p_res.has_next(): 
+                 affected_projects.add(p_res.get_next()[0])
+        
+        for pid in affected_projects:
+            all_warnings.extend(_recalculate_timeline(pid))
+            
         conn.execute("COMMIT")
-        return create_response("create_dependencies_batch", "success", data={"dependencies_created": results})
+        return create_response("create_dependencies_batch", "success", data={"dependencies_created": results}, warnings=all_warnings)
     except Exception as e:
         conn.execute("ROLLBACK")
         return create_response("create_dependencies_batch", "error", warnings=[f"Batch rolled back. Error: {str(e)}"])
+
+@mcp.tool()
+def set_progress_batch(updates: list[dict]) -> str:
+    """
+    Updates progress for multiple tasks at once.
+    updates: [{"task_name": "T1", "percent_complete": 50}, ...]
+    """
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        results = []
+        for u in updates:
+            # Call set_task_progress logic or execute Cypher directly
+            res_str = set_task_progress(u['task_name'], u['percent_complete'], skip_recalc=True)
+            res_json = json.loads(res_str)
+            if res_json.get("status") == "error":
+                raise Exception(f"Task '{u['task_name']}' update failed: {res_json.get('warnings')}")
+            results.append(u['task_name'])
+        # Progress updates might affect timeline if they trigger triggers? Not yet, but good to be safe.
+        # Actually, let's just commit. Progress updates in Ph23 don't shift dates.
+        conn.execute("COMMIT")
+        return create_response("set_progress_batch", "success", data={"updated_tasks": results})
+    except Exception as e:
+        conn.execute("ROLLBACK")
+        return create_response("set_progress_batch", "error", warnings=[str(e)])
 
 @mcp.tool()
 def analyze_root_cause(project_id: str) -> str:
@@ -2415,5 +2692,7 @@ def generate_human_decision_prompt(task_name: str, conflict_description: str) ->
 
 
 if __name__ == "__main__":
+    # Ensure DB is initialized before server starts
+    initialize_schema()
     # By default, mcp.run() uses stdio transport
     mcp.run()

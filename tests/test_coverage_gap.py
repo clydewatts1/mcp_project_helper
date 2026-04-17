@@ -58,18 +58,18 @@ def test_integration_dispatchers(isolated_server):
 def test_negative_error_messages(isolated_server):
     s = isolated_server
     # Project not found
-    assert "Error: Project not found" in s.get_project_graph("NONEXISTENT")
+    assert "not found" in s.get_project_graph("NONEXISTENT")
     
     # Task not found errors
-    assert "Error: Task 'None' not found" in s.lock_task("None")
-    assert "Error: Task 'None' not found" in s.set_task_progress("None", 50)
-    assert "Error: Task 'None' not found" in s.update_task_actual_cost("None", 100)
-    assert "Error: Task 'None' not found" in s.update_estimates("None", 1, 2)
-    assert "Error: Task 'None' not found" in s.generate_agent_sub_prompt("None")
+    assert "not found" in s.lock_task("None")
+    assert "not found" in s.set_task_progress("None", 50)
+    assert "not found" in s.update_task_actual_cost("None", 100)
+    assert "not found" in s.update_estimates("None", 1, 2)
+    assert "not found" in s.generate_agent_sub_prompt("None")
     
     # Empty project reports
     s.create_project("EMPTY", "2026-01-01", "Empty")
-    assert "No activities found" in s.get_evm_report("EMPTY")
+    assert "No activities found" in s.get_evm_report_internal("EMPTY")
     assert "No task data found" in s.get_risk_report("EMPTY")
     assert "No tasks found" in s.get_project_tasks("EMPTY")
     # get_critical_path returns "Critical Path for EMPTY: " if no tasks exist

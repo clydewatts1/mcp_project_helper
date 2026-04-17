@@ -6,12 +6,12 @@ def test_invalid_resource_assignment(isolated_server):
     s.add_task("P_ERR", "T1", 1, 100.0)
     
     res = s.assign_resource("Ghost", "T1", 100)
-    assert "You MUST call the 'add_resource' tool" in res
+    assert "not found" in res
 
 def test_invalid_date_format(isolated_server):
     s = isolated_server
     res = s.create_project("P_DATE", "01-01-2026", "Bad Date")
-    assert "Error: start_date must be in YYYY-MM-DD format" in res
+    assert "Invalid date format" in res
 
 def test_auto_leveler_failure_locked(isolated_server):
     s = isolated_server

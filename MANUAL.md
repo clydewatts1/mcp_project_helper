@@ -56,6 +56,7 @@ These tools allow the LLM to mutate the database, calculate math, and orchestrat
 
 * delete_task(task_name): Safely deletes a task after severing all dependencies, resource assignments, and project containment links.
 * delete_resource(resource_name): Safely deletes a resource after severing all assignments and skill links.
+* unassign_resource(resource_name, task_name): Removes a resource assignment from a task without deleting the resource entity.
 * delete_skill(skill_name): Safely deletes a skill after severing all possession and requirement links.
 * delete_project(project_id): Deletes a project and all its contained tasks (cascading cleanup).
 
@@ -110,13 +111,15 @@ The project engine permits autonomous LLM workers to author and register their o
 To optimize for autonomous agents and prevent timeouts, several tools now support JSON-based batching and explicit tool wrappers for core analytics.
 
 * **Batch Tools**:
-    - `add_tasks_batch(project_id, tasks_json)`: Bulk create tasks. `tasks_json` is an array of objects: `[{"name": "T1", "duration": 5, "cost": 100}, ...]`.
-    - `create_dependencies_batch(dependencies_json)`: Bulk create dependencies. `dependencies_json` is an array of objects: `[{"source": "A", "target": "B", "lag": 0}, ...]`.
+    - `add_tasks_batch(project_id, tasks)`: Bulk create tasks. `tasks` is a native list of objects: `[{"name": "T1", "duration": 5, "cost": 100}, ...]`.
+    - `create_dependencies_batch(dependencies)`: Bulk create dependencies. `dependencies` is a native list of objects: `[{"source": "A", "target": "B", "lag": 0}, ...]`.
+    - `set_progress_batch(updates)`: Bulk update task progress. `updates` is a native list of objects: `[{"task_name": "T1", "percent_complete": 50}, ...]`.
 * **Resource Wrappers (Explicit Tools)**:
     - `get_database_schema_tool()`: Tool-ified version of `system://schema`.
-    - `get_evm_report_tool(project_id)`: Tool-ified version of `project://{id}/reports/evm`.
+    - `get_evm_report_tool(project_id, as_of_date)`: Tool-ified version of `project://{id}/reports/evm`. Supports optional `as_of_date` (YYYY-MM-DD).
     - `get_risk_report_tool(project_id)`: Tool-ified version of `project://{id}/reports/risk`.
     - `get_project_summary(project_id)`: Tool-ified project briefing (formerly webhook).
+    - `export_project_image_tool(project_id)`: Generates a Base64 PNG of the Graphviz network diagram for immediate visual export.
 * **Enhanced CRUD**:
     - `update_task(task_name, duration, cost, description)`: Granularly modify task attributes without deletion. Recalculates timeline automatically if duration changes.
     - `set_task_progress(task_name, percent_complete)`: Now automatically cycles status between `AI_DRAFT`, `IN_PROGRESS`, and `DONE` based on percentage.

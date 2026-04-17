@@ -36,8 +36,8 @@ def test_global_over_allocation(isolated_server):
     s.add_task("P2", "T2", 5, 100.0)
     
     s.add_resource("MultiTasker", "HUMAN", 100.0)
-    s.assign_resource("MultiTasker", "T1", 100)
-    s.assign_resource("MultiTasker", "T2", 50)
+    s.assign_resource("MultiTasker", "T1", allocation=100)
+    s.assign_resource("MultiTasker", "T2", allocation=50)
     
     report = s.get_portfolio_allocation_report()
     assert "Resource: MultiTasker" in report

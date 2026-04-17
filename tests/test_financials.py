@@ -35,7 +35,7 @@ def test_evm_math(isolated_server):
     # Set actual cost to 2000 (AC)
     s.update_task_actual_cost("T1", 2000.0)
     
-    report = s.get_evm_report("P_EVM")
+    report = s.get_evm_report_internal("P_EVM")
     
     # EV = 0.5 * 5000 = 2500
     # AC = 2000

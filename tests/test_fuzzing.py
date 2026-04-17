@@ -57,8 +57,8 @@ def test_leveler_fuzzing(isolated_server, alloc1, alloc2):
     s.add_task(pid, "B", 2, 100.0)
     
     s.add_resource("FuzzBot", "HUMAN", 50.0)
-    s.assign_resource("FuzzBot", "A", alloc1)
-    s.assign_resource("FuzzBot", "B", alloc2)
+    s.assign_resource("FuzzBot", "A", allocation=alloc1)
+    s.assign_resource("FuzzBot", "B", allocation=alloc2)
     
     # Ensure tasks have dates or else over-allocation is skiped
     s._recalculate_timeline(pid)
